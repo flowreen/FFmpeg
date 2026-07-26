@@ -35,6 +35,12 @@
 #include "hwcontext.h"
 #include "hwcontext_d3d11va.h"
 #include "hwcontext_internal.h"
+#if CONFIG_CUDA
+#include "hwcontext_cuda_internal.h"
+#endif
+#if CONFIG_VULKAN
+#include "hwcontext_vulkan.h"
+#endif
 #include "imgutils.h"
 #include "mem.h"
 #include "pixdesc.h"
@@ -729,6 +735,146 @@ static int d3d11va_device_create(AVHWDeviceContext *ctx, const char *device,
     return 0;
 }
 
+static int d3d11va_device_find_adapter_by_luid(AVHWDeviceContext *ctx,
+                                               const LUID *luid)
+{
+    HRESULT hr;
+    IDXGIAdapter *adapter = NULL;
+    IDXGIFactory2 *factory;
+    int adapter_id = 0;
+    int ret = -1;
+
+    hr = mCreateDXGIFactory(&IID_IDXGIFactory2, (void **)&factory);
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_ERROR, "CreateDXGIFactory returned error\n");
+        return -1;
+    }
+
+    while (IDXGIFactory2_EnumAdapters(factory, adapter_id++, &adapter) !=
+           DXGI_ERROR_NOT_FOUND) {
+        DXGI_ADAPTER_DESC adapter_desc;
+
+        hr = IDXGIAdapter2_GetDesc(adapter, &adapter_desc);
+        IDXGIAdapter_Release(adapter);
+        if (FAILED(hr)) {
+            av_log(ctx, AV_LOG_DEBUG,
+                   "IDXGIAdapter2_GetDesc returned error, try next adapter\n");
+            continue;
+        }
+
+        if (adapter_desc.AdapterLuid.LowPart  == luid->LowPart &&
+            adapter_desc.AdapterLuid.HighPart == luid->HighPart) {
+            ret = adapter_id - 1;
+            break;
+        }
+    }
+
+    IDXGIFactory2_Release(factory);
+    return ret;
+}
+
+#if CONFIG_CUDA
+/* The LUID of the device a CUDA context runs on, asked of the context
+ * itself: the device index the CUDA device context records is only filled
+ * in for contexts it created, not for one the application supplied. The
+ * LUID is documented as 8 bytes, matching a Windows LUID. cuDeviceGetLuid
+ * is loaded optionally, so it can be absent on an older driver, which is
+ * reported as ENOSYS. */
+static int d3d11va_cuda_luid(AVCUDADeviceContext *cu_hw, LUID *luid)
+{
+    CudaFunctions *cu = cu_hw->internal->cuda_dl;
+    unsigned int node_mask;
+    CUcontext dummy;
+    CUdevice dev;
+    CUresult ret, pop;
+
+    if (!cu->cuDeviceGetLuid)
+        return AVERROR(ENOSYS);
+    if (cu->cuCtxPushCurrent(cu_hw->cuda_ctx) != CUDA_SUCCESS)
+        return AVERROR_EXTERNAL;
+    ret = cu->cuCtxGetDevice(&dev);
+    if (ret == CUDA_SUCCESS)
+        ret = cu->cuDeviceGetLuid((char *)luid, &node_mask, dev);
+    pop = cu->cuCtxPopCurrent(&dummy);
+    return ret != CUDA_SUCCESS || pop != CUDA_SUCCESS ? AVERROR_EXTERNAL : 0;
+}
+#endif
+
+static int d3d11va_device_derive(AVHWDeviceContext *ctx,
+                                 AVHWDeviceContext *src_ctx,
+                                 AVDictionary *opts, int flags)
+{
+    LUID luid;
+    int adapter, ret;
+    char adapter_str[16];
+
+    if ((ret = ff_thread_once(&functions_loaded, load_functions)) != 0)
+        return AVERROR_UNKNOWN;
+    if (!mD3D11CreateDevice || !mCreateDXGIFactory) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Failed to load D3D11 library or its functions\n");
+        return AVERROR_UNKNOWN;
+    }
+
+    switch (src_ctx->type) {
+#if CONFIG_VULKAN
+    case AV_HWDEVICE_TYPE_VULKAN: {
+        AVVulkanDeviceContext *src_hwctx = src_ctx->hwctx;
+        PFN_vkGetPhysicalDeviceProperties2 prop_fn;
+        VkPhysicalDeviceIDProperties vk_idp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+        };
+        VkPhysicalDeviceProperties2 vk_dev_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &vk_idp,
+        };
+
+        prop_fn = (PFN_vkGetPhysicalDeviceProperties2)
+            src_hwctx->get_proc_addr(src_hwctx->inst,
+                                     "vkGetPhysicalDeviceProperties2");
+        if (!prop_fn)
+            return AVERROR(ENOSYS);
+
+        prop_fn(src_hwctx->phys_dev, &vk_dev_props);
+        if (!vk_idp.deviceLUIDValid) {
+            av_log(ctx, AV_LOG_VERBOSE,
+                   "Source device does not expose a LUID\n");
+            return AVERROR(ENOSYS);
+        }
+
+        // VK_LUID_SIZE is defined as 8, which is also the size of a LUID.
+        memcpy(&luid, vk_idp.deviceLUID, sizeof(luid));
+        break;
+    }
+#endif
+#if CONFIG_CUDA
+    case AV_HWDEVICE_TYPE_CUDA:
+        ret = d3d11va_cuda_luid(src_ctx->hwctx, &luid);
+        if (ret == AVERROR(ENOSYS)) {
+            av_log(ctx, AV_LOG_VERBOSE, "cuDeviceGetLuid is unavailable\n");
+            return ret;
+        }
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Unable to get LUID from CUDA\n");
+            return ret;
+        }
+        break;
+#endif
+    default:
+        return AVERROR(ENOSYS);
+    }
+
+    adapter = d3d11va_device_find_adapter_by_luid(ctx, &luid);
+    if (adapter < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to find a d3d11va adapter matching "
+               "the source device\n");
+        return AVERROR(ENODEV);
+    }
+
+    snprintf(adapter_str, sizeof(adapter_str), "%d", adapter);
+    return d3d11va_device_create(ctx, adapter_str, opts, flags);
+}
+
 const HWContextType ff_hwcontext_type_d3d11va = {
     .type                 = AV_HWDEVICE_TYPE_D3D11VA,
     .name                 = "D3D11VA",
@@ -737,6 +883,7 @@ const HWContextType ff_hwcontext_type_d3d11va = {
     .frames_hwctx_size    = sizeof(D3D11VAFramesContext),
 
     .device_create        = d3d11va_device_create,
+    .device_derive        = d3d11va_device_derive,
     .device_init          = d3d11va_device_init,
     .device_uninit        = d3d11va_device_uninit,
     .frames_get_constraints = d3d11va_frames_get_constraints,

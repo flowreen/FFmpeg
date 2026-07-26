@@ -25,6 +25,15 @@
 #include <windows.h> /* Included to prevent conflicts with CreateSemaphore */
 #include <versionhelpers.h>
 #include "compat/w32dlfcn.h"
+#if CONFIG_D3D11VA
+#define COBJMACROS
+#include <initguid.h>
+#include <d3d11.h>
+#include <d3d11_4.h>
+#include <dxgi1_2.h>
+#include "hwcontext_d3d11va.h"
+#include "hwcontext_d3d11va_internal.h"
+#endif
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -158,6 +167,12 @@ typedef struct VulkanDevicePriv {
     /* Opaque FD external semaphore properties */
     VkExternalSemaphoreProperties ext_sem_props_opaque;
 
+#ifdef _WIN32
+    /* D3D12 fence external semaphore properties for timeline semaphores.
+     * D3D11 fences are shared through the same handle type. */
+    VkExternalSemaphoreProperties ext_sem_props_d3d12_fence;
+#endif
+
     /* Enabled features */
     VulkanDeviceFeatures feats;
 
@@ -210,6 +225,14 @@ typedef struct VulkanFramesPriv {
 
     /* Set when physical device reports DEDICATED_ONLY for DMA-BUF export (try_export_flags) */
     int export_requires_dedicated;
+
+#if CONFIG_D3D11VA
+    /* Shared D3D11 fences imported as timeline semaphores, one for each D3D11
+     * device that frames have been transferred to or from */
+    pthread_mutex_t d3d11_sync_lock;
+    int d3d11_sync_lock_init;
+    struct D3D11SyncState *d3d11_sync;
+#endif
 } VulkanFramesPriv;
 
 typedef struct AVVkFrameInternal {
@@ -2037,6 +2060,24 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
                                                      &ext_sem_props_info,
                                                      &p->ext_sem_props_opaque);
 
+#ifdef _WIN32
+    /* D3D12 fence properties, queried for a timeline semaphore */
+    {
+        VkSemaphoreTypeCreateInfo timeline_info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        };
+        ext_sem_props_info.pNext = &timeline_info;
+        ext_sem_props_info.handleType =
+            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+        p->ext_sem_props_d3d12_fence.sType =
+            VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
+        vk->GetPhysicalDeviceExternalSemaphoreProperties(hwctx->phys_dev,
+            &ext_sem_props_info, &p->ext_sem_props_d3d12_fence);
+        ext_sem_props_info.pNext = NULL;
+    }
+#endif
+
     qf = av_malloc_array(qf_num, sizeof(VkQueueFamilyProperties2));
     if (!qf)
         return AVERROR(ENOMEM);
@@ -3001,6 +3042,118 @@ static void unlock_frame(AVHWFramesContext *fc, AVVkFrame *vkf)
     pthread_mutex_unlock(&vkf->internal->update_mutex);
 }
 
+#if CONFIG_D3D11VA
+/* A D3D11 texture imported as a VkImage aliasing its memory */
+typedef struct D3D11Import {
+    VkImage        img;
+    VkDeviceMemory mem;
+} D3D11Import;
+
+/* A D3D11 fence shared with Vulkan as a timeline semaphore. D3D11 signals it
+ * on its immediate context after the commands that produce or consume a
+ * texture, and the transfer submission waits on the imported side, which
+ * orders the copy against D3D11 work entirely on the GPU. One state is kept
+ * for each D3D11 device that frames have been transferred to or from, also
+ * when the fence could not be shared with it: like the other lacks of
+ * interoperability, that is remembered rather than retried. */
+typedef struct D3D11SyncState {
+    struct D3D11SyncState *next;
+    ID3D11Device          *dev;    /* identity of the paired device */
+    int                    status; /* 0 ready, else the remembered error */
+    ID3D11DeviceContext4  *ctx4;
+    ID3D11Fence           *fence;
+    VkSemaphore            sem;   /* the fence imported into Vulkan */
+    uint64_t               value; /* last handed-out point, shared_lock held */
+    uint64_t               vk_point; /* point the last submitted Vulkan copy
+                                      * signals, 0 before the first transfer */
+
+    /* What Vulkan imports is a shared texture of this code's own, created
+     * and imported once per paired device and kept; D3D11 copies move the
+     * frame between it and the frame texture. So neither the frame
+     * texture's sharing, of which D3D11 documents a single handle creation
+     * per texture, nor its subresource layout or lifetime matter to the
+     * import. shared_lock serializes the transfers that use it. */
+    pthread_mutex_t     shared_lock;
+    int                 shared_status; /* 0 untried, 1 ready, else error */
+    ID3D11Texture2D    *tex;
+    D3D11Import         tex_import;
+} D3D11SyncState;
+
+static void d3d11_import_free(AVHWFramesContext *hwfc, D3D11Import *im)
+{
+    VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
+    AVVulkanDeviceContext *hwctx = &p->p;
+    FFVulkanFunctions *vk = &p->vkctx.vkfn;
+
+    if (im->img)
+        vk->DestroyImage(hwctx->act_dev, im->img, hwctx->alloc);
+    if (im->mem)
+        vk->FreeMemory(hwctx->act_dev, im->mem, hwctx->alloc);
+    im->img = VK_NULL_HANDLE;
+    im->mem = VK_NULL_HANDLE;
+}
+
+static void d3d11_shared_free(AVHWFramesContext *hwfc, D3D11SyncState *sync)
+{
+    d3d11_import_free(hwfc, &sync->tex_import);
+    if (sync->tex)
+        ID3D11Texture2D_Release(sync->tex);
+    sync->tex = NULL;
+}
+
+static void d3d11_sync_states_free(AVHWFramesContext *hwfc)
+{
+    VulkanFramesPriv *fp = hwfc->hwctx;
+    VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
+    AVVulkanDeviceContext *hwctx = &p->p;
+    FFVulkanFunctions *vk = &p->vkctx.vkfn;
+    D3D11SyncState *sync = fp->d3d11_sync;
+
+    while (sync) {
+        D3D11SyncState *next = sync->next;
+
+        /* The last Vulkan copy signals the imported semaphore in the same
+         * batch as the semaphore of its execution context, and Vulkan does
+         * not order the signals of one batch against each other. So the
+         * pool drains that precede this do not establish that signal, and
+         * it is waited for here before the semaphore is destroyed. After
+         * device loss the semaphore stays a valid child of the device that
+         * still has to be destroyed, so it is. A wait that fails for any
+         * other reason leaves the semaphore alone rather than destroying
+         * it while its signal may still be pending. */
+        if (sync->sem && sync->vk_point) {
+            VkSemaphoreWaitInfo wait_info = {
+                .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                .semaphoreCount = 1,
+                .pSemaphores    = &sync->sem,
+                .pValues        = &sync->vk_point,
+            };
+            VkResult ret = vk->WaitSemaphores(hwctx->act_dev, &wait_info,
+                                              UINT64_MAX);
+            if (ret != VK_SUCCESS) {
+                av_log(hwfc, AV_LOG_ERROR, "Unable to wait for the last D3D11 "
+                       "transfer to complete: %s\n", ff_vk_ret2str(ret));
+                if (ret != VK_ERROR_DEVICE_LOST)
+                    sync->sem = VK_NULL_HANDLE;
+            }
+        }
+        d3d11_shared_free(hwfc, sync);
+        pthread_mutex_destroy(&sync->shared_lock);
+        if (sync->sem)
+            vk->DestroySemaphore(hwctx->act_dev, sync->sem, hwctx->alloc);
+        if (sync->fence)
+            ID3D11Fence_Release(sync->fence);
+        if (sync->ctx4)
+            ID3D11DeviceContext4_Release(sync->ctx4);
+        if (sync->dev)
+            ID3D11Device_Release(sync->dev);
+        av_free(sync);
+        sync = next;
+    }
+    fp->d3d11_sync = NULL;
+}
+#endif
+
 static void vulkan_frames_uninit(AVHWFramesContext *hwfc)
 {
     VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
@@ -3015,6 +3168,14 @@ static void vulkan_frames_uninit(AVHWFramesContext *hwfc)
     ff_vk_exec_pool_free(&p->vkctx, &fp->compute_exec);
     ff_vk_exec_pool_free(&p->vkctx, &fp->upload_exec);
     ff_vk_exec_pool_free(&p->vkctx, &fp->download_exec);
+
+#if CONFIG_D3D11VA
+    /* After the exec pools have drained every submission that could still
+     * wait on the imported semaphores */
+    d3d11_sync_states_free(hwfc);
+    if (fp->d3d11_sync_lock_init)
+        pthread_mutex_destroy(&fp->d3d11_sync_lock);
+#endif
 
     av_refstruct_pool_uninit(&fp->tmp);
 }
@@ -3193,6 +3354,13 @@ static int vulkan_frames_init(AVHWFramesContext *hwfc)
     int is_lone_dpb = ((hwctx->usage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR) ||
                        ((hwctx->usage & VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR) &&
                         !(hwctx->usage & VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR)));
+
+#if CONFIG_D3D11VA
+    err = pthread_mutex_init(&fp->d3d11_sync_lock, NULL);
+    if (err != 0)
+        return AVERROR(err);
+    fp->d3d11_sync_lock_init = 1;
+#endif
 
     /* Defaults */
     if (!hwctx->nb_layers)
@@ -3441,6 +3609,9 @@ static int vulkan_transfer_get_formats(AVHWFramesContext *hwfc,
 #if CONFIG_CUDA
     n++;
 #endif
+#if CONFIG_D3D11VA
+    n++;
+#endif
     fmts = av_malloc_array(n, sizeof(*fmts));
     if (!fmts)
         return AVERROR(ENOMEM);
@@ -3449,6 +3620,9 @@ static int vulkan_transfer_get_formats(AVHWFramesContext *hwfc,
     fmts[n++] = hwfc->sw_format;
 #if CONFIG_CUDA
     fmts[n++] = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_D3D11VA
+    fmts[n++] = AV_PIX_FMT_D3D11;
 #endif
     fmts[n++] = AV_PIX_FMT_NONE;
 
@@ -5098,12 +5272,722 @@ end:
     return err;
 }
 
+#if CONFIG_D3D11VA
+
+static VkFormat d3d11_to_vulkan_fmt(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:     return VK_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:     return VK_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    default:                             return VK_FORMAT_UNDEFINED;
+    }
+}
+
+/* Running out of memory is worth retrying, and a handle the implementation
+ * refuses to import is a lack of interoperability, reported as ENOSYS so
+ * that the caller falls back to system memory; nothing else a failed
+ * Vulkan call reports here is either. */
+static int d3d11_vk_err(VkResult ret)
+{
+    switch (ret) {
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+        return AVERROR(ENOMEM);
+    case VK_ERROR_INVALID_EXTERNAL_HANDLE:
+        return AVERROR(ENOSYS);
+    default:
+        return AVERROR_EXTERNAL;
+    }
+}
+
+/* Find or create the fence pair for this D3D11 device. Setups on which the
+ * fence cannot be created or imported report unimplemented, so the caller
+ * falls back to system memory. */
+static int d3d11_sync_state_get(AVHWFramesContext *hwfc,
+                                AVD3D11VADeviceContext *d3d_hw,
+                                D3D11SyncState **out)
+{
+    VulkanFramesPriv *fp = hwfc->hwctx;
+    VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
+    AVVulkanDeviceContext *hwctx = &p->p;
+    FFVulkanFunctions *vk = &p->vkctx.vkfn;
+    VkSemaphoreTypeCreateInfo timeline_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+    };
+    VkSemaphoreCreateInfo sem_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &timeline_info,
+    };
+    VkImportSemaphoreWin32HandleInfoKHR imp;
+    D3D11SyncState *sync = NULL;
+    ID3D11Device5 *dev5 = NULL;
+    HANDLE handle = NULL;
+    VkResult ret;
+    HRESULT hr;
+    int err = AVERROR(ENOSYS);
+
+    pthread_mutex_lock(&fp->d3d11_sync_lock);
+
+    for (sync = fp->d3d11_sync; sync; sync = sync->next) {
+        if (sync->dev == d3d_hw->device) {
+            err = sync->status;
+            pthread_mutex_unlock(&fp->d3d11_sync_lock);
+            if (err < 0)
+                return err;
+            *out = sync;
+            return 0;
+        }
+    }
+
+    sync = av_mallocz(sizeof(*sync));
+    if (!sync) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    if (pthread_mutex_init(&sync->shared_lock, NULL)) {
+        av_freep(&sync);
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    if (!(p->vkctx.extensions & FF_VK_EXT_EXTERNAL_WIN32_SEM) ||
+        !(p->ext_sem_props_d3d12_fence.externalSemaphoreFeatures &
+          VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT)) {
+        av_log(hwfc, AV_LOG_DEBUG, "D3D12 fence import is not supported\n");
+        goto fail;
+    }
+
+    /* Fences arrived in D3D11.4, so a device that predates them has nothing
+     * the copy could synchronize against. The immediate context is only
+     * touched under the device lock, like everywhere else. */
+    hr = ID3D11Device_QueryInterface(d3d_hw->device, &IID_ID3D11Device5,
+                                     (void **)&dev5);
+    if (SUCCEEDED(hr)) {
+        d3d_hw->lock(d3d_hw->lock_ctx);
+        hr = ID3D11DeviceContext_QueryInterface(d3d_hw->device_context,
+                                                &IID_ID3D11DeviceContext4,
+                                                (void **)&sync->ctx4);
+        d3d_hw->unlock(d3d_hw->lock_ctx);
+    }
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device5_CreateFence(dev5, 0, D3D11_FENCE_FLAG_SHARED,
+                                       &IID_ID3D11Fence, (void **)&sync->fence);
+    if (dev5)
+        ID3D11Device5_Release(dev5);
+    if (FAILED(hr)) {
+        av_log(hwfc, AV_LOG_DEBUG, "Unable to create a shared fence (%lx)\n",
+               (long)hr);
+        err = ff_d3d11va_hr_err(hr);
+        goto fail;
+    }
+    /* Unlike the runtime and the fence, the handle says nothing about what
+     * the device can do, so its failure is not remembered. */
+    hr = ID3D11Fence_CreateSharedHandle(sync->fence, NULL, GENERIC_ALL, NULL,
+                                        &handle);
+    if (FAILED(hr) || !handle) {
+        av_log(hwfc, AV_LOG_DEBUG, "Unable to share the fence (%lx)\n",
+               (long)hr);
+        err = hr == E_OUTOFMEMORY ? AVERROR(ENOMEM) : AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    ret = vk->CreateSemaphore(hwctx->act_dev, &sem_info, hwctx->alloc,
+                              &sync->sem);
+    if (ret != VK_SUCCESS) {
+        av_log(hwfc, AV_LOG_ERROR, "Cannot create the import semaphore: %s\n",
+               ff_vk_ret2str(ret));
+        err = d3d11_vk_err(ret);
+        goto fail;
+    }
+
+    imp = (VkImportSemaphoreWin32HandleInfoKHR) {
+        .sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+        .semaphore  = sync->sem,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
+        .handle     = handle,
+    };
+    ret = vk->ImportSemaphoreWin32HandleKHR(hwctx->act_dev, &imp);
+    if (ret != VK_SUCCESS) {
+        av_log(hwfc, AV_LOG_DEBUG, "Cannot import the fence: %s\n",
+               ff_vk_ret2str(ret));
+        err = d3d11_vk_err(ret);
+        goto fail;
+    }
+    CloseHandle(handle);
+
+    ID3D11Device_AddRef(d3d_hw->device);
+    sync->dev  = d3d_hw->device;
+    sync->next = fp->d3d11_sync;
+    fp->d3d11_sync = sync;
+    pthread_mutex_unlock(&fp->d3d11_sync_lock);
+
+    *out = sync;
+    return 0;
+
+fail:
+    if (handle)
+        CloseHandle(handle);
+    if (sync) {
+        if (sync->sem)
+            vk->DestroySemaphore(hwctx->act_dev, sync->sem, hwctx->alloc);
+        if (sync->fence)
+            ID3D11Fence_Release(sync->fence);
+        if (sync->ctx4)
+            ID3D11DeviceContext4_Release(sync->ctx4);
+        sync->sem   = VK_NULL_HANDLE;
+        sync->fence = NULL;
+        sync->ctx4  = NULL;
+        if (err == AVERROR(ENOSYS)) {
+            /* A lack of interoperability is kept, so that the next transfer
+             * does not repeat the attempt. */
+            ID3D11Device_AddRef(d3d_hw->device);
+            sync->dev    = d3d_hw->device;
+            sync->status = err;
+            sync->next   = fp->d3d11_sync;
+            fp->d3d11_sync = sync;
+        } else {
+            pthread_mutex_destroy(&sync->shared_lock);
+            av_free(sync);
+        }
+    }
+    pthread_mutex_unlock(&fp->d3d11_sync_lock);
+    return err;
+}
+
+/* Import one of the shared textures created here as a VkImage aliasing the
+ * same memory. */
+static int d3d11_import(AVHWFramesContext *hwfc, ID3D11Texture2D *tex,
+                        D3D11Import *im)
+{
+    VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
+    AVVulkanDeviceContext *hwctx = &p->p;
+    FFVulkanFunctions *vk = &p->vkctx.vkfn;
+    VkExternalMemoryHandleTypeFlagBits handle_type;
+    VkExternalMemoryImageCreateInfo ext_info;
+    VkMemoryWin32HandlePropertiesKHR hprops = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+    };
+    VkImageMemoryRequirementsInfo2 req_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+    };
+    VkMemoryRequirements2 req = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+    };
+    D3D11_TEXTURE2D_DESC desc;
+    HANDLE handle = NULL;
+    uint32_t bits;
+    int nt_handle;
+    VkImageUsageFlags usage;
+    VkResult ret;
+    HRESULT hr;
+    int index, err = AVERROR_EXTERNAL;
+
+    memset(im, 0, sizeof(*im));
+
+    /* Which kind of handle the texture shares through depends on the
+     * runtime it was created on. */
+    ID3D11Texture2D_GetDesc(tex, &desc);
+    nt_handle = !!(desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+    if (nt_handle)
+        handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    else
+        handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    if (d3d11_to_vulkan_fmt(desc.Format) == VK_FORMAT_UNDEFINED) {
+        av_log(hwfc, AV_LOG_DEBUG, "DXGI format %d cannot be imported\n",
+               (int)desc.Format);
+        return AVERROR(ENOSYS);
+    }
+
+    /* The layout a driver picks for an image can depend on how it may be
+     * used, so mirror the texture's bind flags. */
+    usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+        usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
+        usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+        usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+
+    /* Creating an external image is only defined for combinations the
+     * implementation reports as importable; the query itself can run out
+     * of memory. */
+    {
+        VkPhysicalDeviceExternalImageFormatInfo ext_fmt_info = {
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            .handleType = handle_type,
+        };
+        VkPhysicalDeviceImageFormatInfo2 fmt_info = {
+            .sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            .pNext  = &ext_fmt_info,
+            .format = d3d11_to_vulkan_fmt(desc.Format),
+            .type   = VK_IMAGE_TYPE_2D,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage  = usage,
+        };
+        VkExternalImageFormatProperties ext_fmt_props = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+        };
+        VkImageFormatProperties2 fmt_props = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+            .pNext = &ext_fmt_props,
+        };
+
+        ret = vk->GetPhysicalDeviceImageFormatProperties2(hwctx->phys_dev,
+                                                          &fmt_info,
+                                                          &fmt_props);
+        if (ret != VK_SUCCESS) {
+            av_log(hwfc, AV_LOG_DEBUG, "Cannot query the image format: %s\n",
+                   ff_vk_ret2str(ret));
+            return ret == VK_ERROR_FORMAT_NOT_SUPPORTED ? AVERROR(ENOSYS)
+                                                        : d3d11_vk_err(ret);
+        }
+        if (!(ext_fmt_props.externalMemoryProperties.externalMemoryFeatures &
+              VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)) {
+            av_log(hwfc, AV_LOG_DEBUG,
+                   "The image cannot import this handle type\n");
+            return AVERROR(ENOSYS);
+        }
+    }
+
+    if (nt_handle) {
+        IDXGIResource1 *res1 = NULL;
+        hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1,
+                                            (void **)&res1);
+        if (SUCCEEDED(hr)) {
+            hr = IDXGIResource1_CreateSharedHandle(res1, NULL,
+                                                   DXGI_SHARED_RESOURCE_READ |
+                                                   DXGI_SHARED_RESOURCE_WRITE,
+                                                   NULL, &handle);
+            IDXGIResource1_Release(res1);
+        }
+    } else {
+        IDXGIResource *res = NULL;
+        hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource,
+                                            (void **)&res);
+        if (SUCCEEDED(hr)) {
+            hr = IDXGIResource_GetSharedHandle(res, &handle);
+            IDXGIResource_Release(res);
+        }
+    }
+    if (FAILED(hr) || !handle) {
+        av_log(hwfc, AV_LOG_ERROR, "Unable to get a shared handle (%lx)\n",
+               (long)hr);
+        return hr == E_OUTOFMEMORY ? AVERROR(ENOMEM) : AVERROR_EXTERNAL;
+    }
+
+    ext_info = (VkExternalMemoryImageCreateInfo) {
+        .sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = handle_type,
+    };
+
+    ret = vk->CreateImage(hwctx->act_dev, &(VkImageCreateInfo) {
+            .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext         = &ext_info,
+            .imageType     = VK_IMAGE_TYPE_2D,
+            .format        = d3d11_to_vulkan_fmt(desc.Format),
+            .extent        = { desc.Width, desc.Height, 1 },
+            .mipLevels     = 1,
+            .arrayLayers   = 1,
+            .samples       = VK_SAMPLE_COUNT_1_BIT,
+            .tiling        = VK_IMAGE_TILING_OPTIMAL,
+            .usage         = usage,
+            .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        }, hwctx->alloc, &im->img);
+    if (ret != VK_SUCCESS) {
+        av_log(hwfc, AV_LOG_ERROR, "Cannot create the import image: %s\n",
+               ff_vk_ret2str(ret));
+        err = d3d11_vk_err(ret);
+        goto fail;
+    }
+
+    /* A handle this device cannot import at all, a texture belonging to
+     * another adapter being the likely reason, is a fall back rather than
+     * an error, which is how the helper reports it. */
+    ret = vk->GetMemoryWin32HandlePropertiesKHR(hwctx->act_dev, handle_type,
+                                                handle, &hprops);
+    if (ret != VK_SUCCESS) {
+        av_log(hwfc, AV_LOG_DEBUG, "Cannot query the handle properties: %s\n",
+               ff_vk_ret2str(ret));
+        err = d3d11_vk_err(ret);
+        goto fail;
+    }
+
+    req_info.image = im->img;
+    vk->GetImageMemoryRequirements2(hwctx->act_dev, &req_info, &req);
+
+    /* The memory types an image of this description accepts, and the ones
+     * a texture of this description imports as, follow from the description
+     * rather than from the attempt, so a pairing without a common one is a
+     * lack of interoperability, remembered by the caller like the other
+     * ENOSYS results. */
+    bits = req.memoryRequirements.memoryTypeBits & hprops.memoryTypeBits;
+    if (!bits) {
+        av_log(hwfc, AV_LOG_DEBUG, "No memory type is common to the image "
+               "and the imported handle\n");
+        err = AVERROR(ENOSYS);
+        goto fail;
+    }
+    for (index = 0; !(bits & (1u << index)); index++)
+        ;
+
+    /* Imports of D3D11 textures are reported as dedicated-only */
+    ret = vk->AllocateMemory(hwctx->act_dev, &(VkMemoryAllocateInfo) {
+            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext           = &(VkMemoryDedicatedAllocateInfo) {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                .pNext = &(VkImportMemoryWin32HandleInfoKHR) {
+                    .sType      =
+                        VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+                    .handleType = handle_type,
+                    .handle     = handle,
+                },
+                .image = im->img,
+            },
+            .allocationSize  = req.memoryRequirements.size,
+            .memoryTypeIndex = index,
+        }, hwctx->alloc, &im->mem);
+    if (ret != VK_SUCCESS) {
+        av_log(hwfc, AV_LOG_ERROR, "Cannot import the texture memory: %s\n",
+               ff_vk_ret2str(ret));
+        err = d3d11_vk_err(ret);
+        goto fail;
+    }
+
+    ret = vk->BindImageMemory2(hwctx->act_dev, 1, &(VkBindImageMemoryInfo) {
+            .sType  = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+            .image  = im->img,
+            .memory = im->mem,
+        });
+    if (ret != VK_SUCCESS) {
+        av_log(hwfc, AV_LOG_ERROR, "Cannot bind the imported memory: %s\n",
+               ff_vk_ret2str(ret));
+        err = d3d11_vk_err(ret);
+        goto fail;
+    }
+
+    /* Importing an NT handle does not transfer ownership, so ours has to be
+     * closed. KMT handles are not reference counted and must not be closed. */
+    if (nt_handle)
+        CloseHandle(handle);
+
+    return 0;
+
+fail:
+    if (nt_handle)
+        CloseHandle(handle);
+    d3d11_import_free(hwfc, im);
+    return err;
+}
+
+/* Create and import the shared texture for the frames context's format,
+ * once per paired device. An attempt that found the two APIs unable to
+ * share is remembered, so it is not retried every frame. Any other
+ * failure, running out of memory above all, may not repeat, so what the
+ * attempt did create is released and the next transfer starts over, with
+ * a texture whose sharing handle has not been created yet. */
+static int d3d11_shared_get(AVHWFramesContext *hwfc, D3D11SyncState *sync,
+                            AVD3D11VADeviceContext *d3d_hw)
+{
+    VulkanFramesPriv *fp = hwfc->hwctx;
+    DXGI_FORMAT fmt;
+    int err;
+
+    pthread_mutex_lock(&fp->d3d11_sync_lock);
+    if (sync->shared_status) {
+        err = sync->shared_status > 0 ? 0 : sync->shared_status;
+        goto end;
+    }
+    err = ff_d3d11va_texture_format(hwfc->sw_format, &fmt);
+    if (!err)
+        err = ff_d3d11va_shared_texture_create(d3d_hw->device, hwfc->width,
+                                               hwfc->height, fmt, 0,
+                                               &sync->tex, hwfc);
+    if (!err)
+        err = d3d11_import(hwfc, sync->tex, &sync->tex_import);
+    if (err < 0)
+        d3d11_shared_free(hwfc, sync);
+    if (err == AVERROR(ENOSYS) || err >= 0)
+        sync->shared_status = err < 0 ? err : 1;
+end:
+    pthread_mutex_unlock(&fp->d3d11_sync_lock);
+    return err;
+}
+
+/* Copy between a Vulkan frame and a D3D11 texture. D3D11 cannot import Vulkan
+ * memory, so the texture is always the side that gets imported, and the copy
+ * itself runs on the GPU. */
+static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
+                                 const AVFrame *src, int upload)
+{
+    VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
+    VulkanFramesPriv *fp = hwfc->hwctx;
+    FFVulkanFunctions *vk = &p->vkctx.vkfn;
+    AVFrame *hwf = (AVFrame *)(upload ? dst : src);
+    const AVFrame *d3df = upload ? src : dst;
+    AVVkFrame *hwf_vk = (AVVkFrame *)hwf->data[0];
+    ID3D11Resource *tex = (ID3D11Resource *)d3df->data[0];
+    UINT index = (UINT)(intptr_t)d3df->data[1];
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(hwfc->sw_format);
+    AVHWFramesContext *d3d_fc;
+    AVD3D11VADeviceContext *d3d_hw;
+    VkImageMemoryBarrier2 img_bar[AV_NUM_DATA_POINTERS + 1];
+    int nb_img_bar = 0;
+    VkImageCopy region;
+    D3D11SyncState *sync;
+    D3D11_TEXTURE2D_DESC desc;
+    D3D11_BOX box = { 0, 0, 0, hwfc->width, hwfc->height, 1 };
+    DXGI_FORMAT fmt;
+    VkImage imp_img;
+    uint64_t sync_point, vk_point;
+    FFVkExecContext *exec;
+    VkCommandBuffer cmd_buf;
+    HRESULT hr;
+    int err;
+
+    /* The copy moves bits, so the two sides have to agree on what the bits
+     * mean. Differing formats of the same size would silently reinterpret
+     * the pixels. */
+    if (!d3df->hw_frames_ctx ||
+        ((AVHWFramesContext *)d3df->hw_frames_ctx->data)->sw_format !=
+        hwfc->sw_format)
+        return AVERROR(ENOSYS);
+
+    d3d_fc = (AVHWFramesContext *)d3df->hw_frames_ctx->data;
+    d3d_hw = d3d_fc->device_ctx->hwctx;
+
+    /* The D3D11 copies address the frame-sized region of the texture, which
+     * decoders often pad, and its subresource by array slice, which is only
+     * its index in a texture without mip levels. Only single plane formats
+     * qualify: no D3D11 copy can address the planes of a planar texture,
+     * and packed subsampled formats constrain copy regions in ways this
+     * code does not track. The texture must really be in the format the sw
+     * format implies, or the copies would silently move nothing. A
+     * keyed-mutex texture is only coherent for a user that acquires the
+     * mutex, which this code does not do. */
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)tex, &desc);
+    if (av_pix_fmt_count_planes(hwfc->sw_format) != 1 ||
+        pixdesc->log2_chroma_w || pixdesc->log2_chroma_h ||
+        ff_d3d11va_texture_format(hwfc->sw_format, &fmt) < 0 ||
+        desc.Format != fmt ||
+        desc.Width < hwfc->width || desc.Height < hwfc->height ||
+        desc.SampleDesc.Count != 1 || desc.MipLevels != 1 ||
+        index >= desc.ArraySize ||
+        (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+        return AVERROR(ENOSYS);
+
+    err = d3d11_sync_state_get(hwfc, d3d_hw, &sync);
+    if (err < 0)
+        return err;
+    err = d3d11_shared_get(hwfc, sync, d3d_hw);
+    if (err < 0)
+        return err;
+
+    pthread_mutex_lock(&sync->shared_lock);
+    imp_img = sync->tex_import.img;
+
+    /* Stage the frame in the shared texture, and signal the fence after the
+     * D3D11 commands that produced the texture or, for a download, that may
+     * still be reading the shared texture about to be overwritten. The copy
+     * below waits for that point on the imported side, so it is ordered
+     * against D3D11 work without blocking the CPU. The Vulkan copy signals
+     * the next point when it is done, and the D3D11 context waits for that
+     * before it touches the shared texture again, so neither side waits on
+     * the CPU. It also keeps the fence value growing: every D3D11 signal is
+     * queued behind the previous Vulkan signal. */
+    d3d_hw->lock(d3d_hw->lock_ctx);
+    if (sync->vk_point) {
+        hr = ID3D11DeviceContext4_Wait(sync->ctx4, sync->fence, sync->vk_point);
+        if (FAILED(hr)) {
+            d3d_hw->unlock(d3d_hw->lock_ctx);
+            av_log(hwfc, AV_LOG_ERROR, "Unable to wait on the D3D11 fence (%lx)\n",
+                   (long)hr);
+            err = AVERROR_EXTERNAL;
+            goto end;
+        }
+    }
+    if (upload)
+        ID3D11DeviceContext_CopySubresourceRegion(d3d_hw->device_context,
+            (ID3D11Resource *)sync->tex, 0, 0, 0, 0, tex, index, &box);
+    sync_point = ++sync->value;
+    hr = ID3D11DeviceContext4_Signal(sync->ctx4, sync->fence, sync_point);
+    ID3D11DeviceContext_Flush(d3d_hw->device_context);
+    d3d_hw->unlock(d3d_hw->lock_ctx);
+    /* The copy below waits for this value, so a signal that never got
+     * submitted would leave the wait outstanding for good. */
+    if (FAILED(hr)) {
+        av_log(hwfc, AV_LOG_ERROR, "Unable to signal the D3D11 fence (%lx)\n",
+               (long)hr);
+        err = AVERROR_EXTERNAL;
+        goto end;
+    }
+
+    exec = ff_vk_exec_get(&p->vkctx, upload ? &fp->upload_exec :
+                                              &fp->download_exec);
+    cmd_buf = exec->buf;
+    err = ff_vk_exec_start(&p->vkctx, exec);
+    if (err < 0)
+        goto end;
+
+    err = ff_vk_exec_add_dep_frame(&p->vkctx, exec, hwf,
+                                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+    if (err < 0)
+        goto fail;
+
+    /* ALL_COMMANDS rather than TRANSFER: the wait has to order the queue
+     * family acquire below too, and acquire operations happen in no defined
+     * stage. */
+    ff_vk_exec_add_dep_wait_sem(&p->vkctx, exec, sync->sem, sync_point,
+                                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+
+    ff_vk_frame_barrier(&p->vkctx, exec, hwf, img_bar, &nb_img_bar,
+                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                        upload ? VK_ACCESS_TRANSFER_WRITE_BIT :
+                                 VK_ACCESS_TRANSFER_READ_BIT,
+                        upload ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL :
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        p->nb_img_qfs > 1 ? VK_QUEUE_FAMILY_IGNORED
+                                          : p->img_qfs[0]);
+
+    /* Acquire the imported image from the external owner. When we are reading
+     * it, the contents D3D11 left behind have to be preserved, so it cannot
+     * be acquired from VK_IMAGE_LAYOUT_UNDEFINED. */
+    img_bar[nb_img_bar++] = (VkImageMemoryBarrier2) {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = 0,
+        .dstAccessMask = upload ? VK_ACCESS_2_TRANSFER_READ_BIT :
+                                  VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .oldLayout     = upload ? VK_IMAGE_LAYOUT_GENERAL :
+                                  VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout     = upload ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        /* This is an ownership acquire, so the destination has to be the
+         * queue family the command buffer itself was allocated from. */
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+        .dstQueueFamilyIndex = exec->qf,
+        .image               = imp_img,
+        .subresourceRange    = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+
+    vk->CmdPipelineBarrier2(cmd_buf, &(VkDependencyInfo) {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pImageMemoryBarriers    = img_bar,
+            .imageMemoryBarrierCount = nb_img_bar,
+        });
+
+    region = (VkImageCopy) {
+        .srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .layerCount = 1 },
+        .dstSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .layerCount = 1 },
+        .extent         = { hwfc->width, hwfc->height, 1 },
+    };
+    if (upload)
+        vk->CmdCopyImage(cmd_buf, imp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         hwf_vk->img[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &region);
+    else
+        vk->CmdCopyImage(cmd_buf, hwf_vk->img[0],
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         imp_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &region);
+
+    /* Release the imported image back to the external owner, which makes the
+     * write available to D3D11 when this was a download. */
+    img_bar[0] = (VkImageMemoryBarrier2) {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = upload ? VK_ACCESS_2_TRANSFER_READ_BIT :
+                                  VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstAccessMask = 0,
+        .oldLayout     = upload ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = exec->qf,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+        .image               = imp_img,
+        .subresourceRange    = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+
+    vk->CmdPipelineBarrier2(cmd_buf, &(VkDependencyInfo) {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pImageMemoryBarriers    = img_bar,
+            .imageMemoryBarrierCount = 1,
+        });
+
+    /* The point the D3D11 side waits for, see above. */
+    vk_point = ++sync->value;
+    ff_vk_exec_add_dep_signal_sem(&p->vkctx, exec, sync->sem, vk_point,
+                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+
+    err = ff_vk_exec_submit(&p->vkctx, exec);
+    if (err >= 0) {
+        sync->vk_point = vk_point;
+        /* An upload is complete for later Vulkan users through the frame's
+         * own semaphore. A download finishes with the copy into the
+         * destination texture, queued on the D3D11 context behind the
+         * Vulkan copy like any other D3D11 command. */
+        if (!upload) {
+            d3d_hw->lock(d3d_hw->lock_ctx);
+            hr = ID3D11DeviceContext4_Wait(sync->ctx4, sync->fence, vk_point);
+            if (SUCCEEDED(hr))
+                ID3D11DeviceContext_CopySubresourceRegion(
+                    d3d_hw->device_context, tex, index, 0, 0, 0,
+                    (ID3D11Resource *)sync->tex, 0, NULL);
+            d3d_hw->unlock(d3d_hw->lock_ctx);
+            if (FAILED(hr)) {
+                av_log(hwfc, AV_LOG_ERROR,
+                       "Unable to wait on the D3D11 fence (%lx)\n", (long)hr);
+                err = AVERROR_EXTERNAL;
+            }
+        }
+    }
+    goto end;
+
+fail:
+    ff_vk_exec_discard(&p->vkctx, exec);
+
+end:
+    pthread_mutex_unlock(&sync->shared_lock);
+
+    return err;
+}
+
+#endif /* CONFIG_D3D11VA */
+
 static int vulkan_transfer_data_to(AVHWFramesContext *hwfc, AVFrame *dst,
                                    const AVFrame *src)
 {
     av_unused VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
 
     switch (src->format) {
+#if CONFIG_D3D11VA
+    case AV_PIX_FMT_D3D11:
+        if (p->vkctx.extensions & FF_VK_EXT_EXTERNAL_WIN32_MEMORY)
+            return vulkan_transfer_d3d11(hwfc, dst, src, 1);
+        /* Deliberately not falling through: the CUDA case below would then
+         * be reached with a D3D11 frame. The generic path rejects hw frames
+         * too. */
+        return AVERROR(ENOSYS);
+#endif
 #if CONFIG_CUDA
     case AV_PIX_FMT_CUDA:
 #ifdef _WIN32
@@ -5225,6 +6109,13 @@ static int vulkan_transfer_data_from(AVHWFramesContext *hwfc, AVFrame *dst,
     av_unused VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
 
     switch (dst->format) {
+#if CONFIG_D3D11VA
+    case AV_PIX_FMT_D3D11:
+        if (p->vkctx.extensions & FF_VK_EXT_EXTERNAL_WIN32_MEMORY)
+            return vulkan_transfer_d3d11(hwfc, dst, src, 0);
+        /* Deliberately not falling through, as above. */
+        return AVERROR(ENOSYS);
+#endif
 #if CONFIG_CUDA
     case AV_PIX_FMT_CUDA:
 #ifdef _WIN32

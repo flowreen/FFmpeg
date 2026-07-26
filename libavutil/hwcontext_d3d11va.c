@@ -34,6 +34,7 @@
 #include "common.h"
 #include "hwcontext.h"
 #include "hwcontext_d3d11va.h"
+#include "hwcontext_d3d11va_internal.h"
 #include "hwcontext_internal.h"
 #if CONFIG_CUDA
 #include "hwcontext_cuda_internal.h"
@@ -375,17 +376,20 @@ static int d3d11va_transfer_get_formats(AVHWFramesContext *ctx,
 {
     D3D11VAFramesContext *s = ctx->hwctx;
     enum AVPixelFormat *fmts;
+    int n = 0;
 
-    fmts = av_malloc_array(2, sizeof(*fmts));
+    fmts = av_malloc_array(3, sizeof(*fmts));
     if (!fmts)
         return AVERROR(ENOMEM);
 
-    fmts[0] = ctx->sw_format;
-    fmts[1] = AV_PIX_FMT_NONE;
-
     // Don't signal support for opaque formats. Actual access would fail.
-    if (s->format == DXGI_FORMAT_420_OPAQUE)
-        fmts[0] = AV_PIX_FMT_NONE;
+    if (s->format != DXGI_FORMAT_420_OPAQUE) {
+        fmts[n++] = ctx->sw_format;
+#if CONFIG_VULKAN
+        fmts[n++] = AV_PIX_FMT_VULKAN;
+#endif
+    }
+    fmts[n] = AV_PIX_FMT_NONE;
 
     *formats = fmts;
 
@@ -452,8 +456,14 @@ static int d3d11va_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
     HRESULT hr;
     int res;
 
-    if (frame->hw_frames_ctx->data != (uint8_t *)ctx || other->format != ctx->sw_format)
+    if (frame->hw_frames_ctx->data != (uint8_t *)ctx)
         return AVERROR(EINVAL);
+
+    /* Not a transfer to or from a software frame we can handle. Report this as
+     * unimplemented rather than invalid, so that a hardware to hardware
+     * transfer can still be tried from the other side. */
+    if (other->format != ctx->sw_format)
+        return AVERROR(ENOSYS);
 
     device_hwctx->lock(device_hwctx->lock_ctx);
 
@@ -510,6 +520,62 @@ map_failed:
     device_hwctx->unlock(device_hwctx->lock_ctx);
     return AVERROR_UNKNOWN;
 }
+
+#if CONFIG_VULKAN || CONFIG_CUDA
+
+int ff_d3d11va_hr_err(HRESULT hr)
+{
+    return hr == E_OUTOFMEMORY ? AVERROR(ENOMEM) : AVERROR(ENOSYS);
+}
+
+int ff_d3d11va_texture_format(enum AVPixelFormat sw_format,
+                              DXGI_FORMAT *format)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++) {
+        if (supported_formats[i].pix_fmt == sw_format) {
+            *format = supported_formats[i].d3d_format;
+            return 0;
+        }
+    }
+    return AVERROR(ENOSYS);
+}
+
+int ff_d3d11va_shared_texture_create(ID3D11Device *dev, int width, int height,
+                                     DXGI_FORMAT format, UINT bind_flags,
+                                     ID3D11Texture2D **tex, void *log_ctx)
+{
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width      = width,
+        .Height     = height,
+        .MipLevels  = 1,
+        .ArraySize  = 1,
+        .Format     = format,
+        .SampleDesc = { .Count = 1 },
+        .Usage      = D3D11_USAGE_DEFAULT,
+        .BindFlags  = bind_flags,
+        .MiscFlags  = D3D11_RESOURCE_MISC_SHARED |
+                      D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    };
+    HRESULT hr;
+
+    *tex = NULL;
+    hr = ID3D11Device_CreateTexture2D(dev, &desc, NULL, tex);
+    /* D3D11.0 runtimes reject NT handle sharing. Running out of memory says
+     * nothing about the runtime, so it does not fall back. */
+    if (FAILED(hr) && hr != E_OUTOFMEMORY) {
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        hr = ID3D11Device_CreateTexture2D(dev, &desc, NULL, tex);
+    }
+    if (FAILED(hr)) {
+        av_log(log_ctx, AV_LOG_DEBUG, "Cannot create a shared texture (%lx)\n",
+               (long)hr);
+        *tex = NULL;
+        return ff_d3d11va_hr_err(hr);
+    }
+    return 0;
+}
+
+#endif /* CONFIG_VULKAN || CONFIG_CUDA */
 
 static int d3d11va_device_init(AVHWDeviceContext *hwdev)
 {

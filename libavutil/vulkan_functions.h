@@ -266,7 +266,9 @@ typedef uint64_t FFVulkanExtensions;
 /* Macro containing every win32 specific function that we utilize in our codebase */
 #define FN_LIST_WIN32(MACRO)                                                             \
     MACRO(1, 1, FF_VK_EXT_EXTERNAL_WIN32_SEM,    GetSemaphoreWin32HandleKHR)             \
-    MACRO(1, 1, FF_VK_EXT_EXTERNAL_WIN32_MEMORY, GetMemoryWin32HandleKHR)
+    MACRO(1, 1, FF_VK_EXT_EXTERNAL_WIN32_SEM,    ImportSemaphoreWin32HandleKHR)          \
+    MACRO(1, 1, FF_VK_EXT_EXTERNAL_WIN32_MEMORY, GetMemoryWin32HandleKHR)                \
+    MACRO(1, 1, FF_VK_EXT_EXTERNAL_WIN32_MEMORY, GetMemoryWin32HandlePropertiesKHR)
 
 /* Macro to turn a function name into a definition */
 #define PFN_DEF(req_inst, req_dev, ext_flag, name) \

@@ -240,7 +240,8 @@ SKIPHEADERS-$(CONFIG_ZLIB)             += zlib_utils.h
 SKIPHEADERS-$(HAVE_CUDA_H)             += hwcontext_cuda.h
 SKIPHEADERS-$(CONFIG_CUDA)             += hwcontext_cuda_internal.h     \
                                           cuda_check.h
-SKIPHEADERS-$(CONFIG_D3D11VA)          += hwcontext_d3d11va.h
+SKIPHEADERS-$(CONFIG_D3D11VA)          += hwcontext_d3d11va.h           \
+                                          hwcontext_d3d11va_internal.h
 SKIPHEADERS-$(CONFIG_D3D12VA)          += hwcontext_d3d12va.h
 SKIPHEADERS-$(CONFIG_DXVA2)            += hwcontext_dxva2.h
 SKIPHEADERS-$(CONFIG_AMF)              += hwcontext_amf.h               \

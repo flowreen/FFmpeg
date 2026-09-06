@@ -24,6 +24,9 @@
 
 #include <initguid.h>
 #include <d3d11.h>
+#if CONFIG_VULKAN || CONFIG_CUDA
+#include <d3dcompiler.h>
+#endif
 #include <dxgi1_2.h>
 
 #if HAVE_DXGIDEBUG_H
@@ -523,6 +526,69 @@ map_failed:
 
 #if CONFIG_VULKAN || CONFIG_CUDA
 
+/* The plane bridge shared by the interop transfer paths, see
+ * hwcontext_d3d11va_internal.h for what it is and why. */
+
+static const char bridge_shader_r[] =
+    "Texture2D<float>   s : register(t0);\n"
+    "RWTexture2D<float> d : register(u0);\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 t : SV_DispatchThreadID) { d[t.xy] = s[t.xy]; }\n";
+
+static const char bridge_shader_rg[] =
+    "Texture2D<float2>   s : register(t0);\n"
+    "RWTexture2D<float2> d : register(u0);\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 t : SV_DispatchThreadID) { d[t.xy] = s[t.xy]; }\n";
+
+int ff_d3d11va_bridge_formats(enum AVPixelFormat sw, DXGI_FORMAT *tex,
+                              DXGI_FORMAT plane[2])
+{
+    switch (sw) {
+    case AV_PIX_FMT_NV12:
+        *tex = DXGI_FORMAT_NV12;
+        plane[0] = DXGI_FORMAT_R8_UNORM;
+        plane[1] = DXGI_FORMAT_R8G8_UNORM;
+        return 0;
+    case AV_PIX_FMT_P010:
+    case AV_PIX_FMT_P012:
+    case AV_PIX_FMT_P016:
+        *tex = sw == AV_PIX_FMT_P010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_P016;
+        plane[0] = DXGI_FORMAT_R16_UNORM;
+        plane[1] = DXGI_FORMAT_R16G16_UNORM;
+        return 0;
+    default:
+        return AVERROR(ENOSYS);
+    }
+}
+
+void ff_d3d11va_bridge_free(FFD3D11PlaneBridge **bridge)
+{
+    FFD3D11PlaneBridge *b = *bridge;
+
+    if (!b)
+        return;
+    for (int i = 0; i < 2; i++) {
+        if (b->plane_uav[i])
+            ID3D11UnorderedAccessView_Release(b->plane_uav[i]);
+        if (b->plane_srv[i])
+            ID3D11ShaderResourceView_Release(b->plane_srv[i]);
+        if (b->planes[i])
+            ID3D11Texture2D_Release(b->planes[i]);
+        if (b->staging_uav[i])
+            ID3D11UnorderedAccessView_Release(b->staging_uav[i]);
+        if (b->staging_srv[i])
+            ID3D11ShaderResourceView_Release(b->staging_srv[i]);
+        if (b->cs[i])
+            ID3D11ComputeShader_Release(b->cs[i]);
+    }
+    if (b->staging)
+        ID3D11Texture2D_Release(b->staging);
+    if (b->compiler)
+        dlclose(b->compiler);
+    av_freep(bridge);
+}
+
 int ff_d3d11va_hr_err(HRESULT hr)
 {
     return hr == E_OUTOFMEMORY ? AVERROR(ENOMEM) : AVERROR(ENOSYS);
@@ -573,6 +639,218 @@ int ff_d3d11va_shared_texture_create(ID3D11Device *dev, int width, int height,
         return ff_d3d11va_hr_err(hr);
     }
     return 0;
+}
+
+int ff_d3d11va_bridge_create(FFD3D11PlaneBridge **bridge, ID3D11Device *dev,
+                             int width, int height,
+                             enum AVPixelFormat sw_format, void *log_ctx)
+{
+    const char *cs_src[2] = { bridge_shader_r, bridge_shader_rg };
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(sw_format);
+    D3D11_TEXTURE2D_DESC desc;
+    DXGI_FORMAT fmt, pfmts[2];
+    FFD3D11PlaneBridge *b;
+    pD3DCompile compile;
+    HRESULT hr;
+    int err;
+
+    err = ff_d3d11va_bridge_formats(sw_format, &fmt, pfmts);
+    if (err < 0)
+        return err;
+
+    b = *bridge = av_mallocz(sizeof(*b));
+    if (!b)
+        return AVERROR(ENOMEM);
+    b->width      = width;
+    b->height     = height;
+    b->plane_w[0] = width;
+    b->plane_h[0] = height;
+    b->plane_w[1] = AV_CEIL_RSHIFT(width,  pixdesc->log2_chroma_w);
+    b->plane_h[1] = AV_CEIL_RSHIFT(height, pixdesc->log2_chroma_h);
+
+    /* The shaders are compiled at run time through d3dcompiler_47, loaded
+     * on demand: libavutil cannot compile HLSL at build time, and a system
+     * without the DLL keeps the system memory route. */
+    b->compiler = dlopen("d3dcompiler_47.dll", 0);
+    compile = b->compiler ? (pD3DCompile)dlsym(b->compiler, "D3DCompile")
+                          : NULL;
+    if (!compile) {
+        av_log(log_ctx, AV_LOG_DEBUG, "d3dcompiler_47 is not available\n");
+        err = AVERROR(ENOSYS);
+        goto fail;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        ID3DBlob *code = NULL, *errors = NULL;
+        hr = compile(cs_src[i], strlen(cs_src[i]), NULL, NULL, NULL, "main",
+                     "cs_5_0", 0, 0, &code, &errors);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateComputeShader(dev,
+                    ID3D10Blob_GetBufferPointer(code),
+                    ID3D10Blob_GetBufferSize(code), NULL, &b->cs[i]);
+        if (code)
+            ID3D10Blob_Release(code);
+        if (errors)
+            ID3D10Blob_Release(errors);
+        if (FAILED(hr)) {
+            av_log(log_ctx, AV_LOG_DEBUG,
+                   "Cannot build the copy shader (%lx)\n", (long)hr);
+            err = ff_d3d11va_hr_err(hr);
+            goto fail;
+        }
+    }
+
+    desc = (D3D11_TEXTURE2D_DESC) {
+        .Width      = width,
+        .Height     = height,
+        .MipLevels  = 1,
+        .ArraySize  = 1,
+        .Format     = fmt,
+        .SampleDesc = { .Count = 1 },
+        .Usage      = D3D11_USAGE_DEFAULT,
+        .BindFlags  = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    hr = ID3D11Device_CreateTexture2D(dev, &desc, NULL, &b->staging);
+    if (FAILED(hr) && hr != E_OUTOFMEMORY) {
+        /* Without UAV support the plane textures cannot be assembled into the
+         * staging texture, but moves toward them only ever read it, so keep
+         * those working. Running out of memory says nothing about UAV
+         * support, so it does not fall back. */
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        hr = ID3D11Device_CreateTexture2D(dev, &desc, NULL, &b->staging);
+    }
+    if (FAILED(hr)) {
+        av_log(log_ctx, AV_LOG_DEBUG,
+               "Cannot create the staging texture (%lx)\n", (long)hr);
+        err = ff_d3d11va_hr_err(hr);
+        goto fail;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {
+            .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+            .Texture2D     = { .MipLevels = 1 },
+        };
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {
+            .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        };
+
+        /* A view with a single-plane format selects that plane of the planar
+         * staging texture. */
+        sd.Format = pfmts[i];
+        ud.Format = pfmts[i];
+        hr = ID3D11Device_CreateShaderResourceView(dev,
+                                                   (ID3D11Resource *)b->staging,
+                                                   &sd, &b->staging_srv[i]);
+        if (FAILED(hr)) {
+            av_log(log_ctx, AV_LOG_DEBUG, "Cannot create a plane view (%lx)\n",
+                   (long)hr);
+            err = ff_d3d11va_hr_err(hr);
+            goto fail;
+        }
+        if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
+            /* A view the format does not support leaves downloads
+             * unsupported; running out of memory is worth a retry. */
+            hr = ID3D11Device_CreateUnorderedAccessView(dev,
+                    (ID3D11Resource *)b->staging, &ud, &b->staging_uav[i]);
+            if (hr == E_OUTOFMEMORY) {
+                err = AVERROR(ENOMEM);
+                goto fail;
+            }
+            if (FAILED(hr))
+                av_log(log_ctx, AV_LOG_DEBUG,
+                       "No staging view for plane %d (%lx), no downloads\n",
+                       i, (long)hr);
+        }
+
+        err = ff_d3d11va_shared_texture_create(dev, b->plane_w[i],
+                                               b->plane_h[i], pfmts[i],
+                                               D3D11_BIND_SHADER_RESOURCE |
+                                               D3D11_BIND_UNORDERED_ACCESS,
+                                               &b->planes[i], log_ctx);
+        if (err < 0)
+            goto fail;
+        hr = ID3D11Device_CreateShaderResourceView(dev,
+                (ID3D11Resource *)b->planes[i], NULL, &b->plane_srv[i]);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateUnorderedAccessView(dev,
+                    (ID3D11Resource *)b->planes[i], NULL, &b->plane_uav[i]);
+        if (FAILED(hr)) {
+            av_log(log_ctx, AV_LOG_DEBUG, "Cannot create a plane view (%lx)\n",
+                   (long)hr);
+            err = ff_d3d11va_hr_err(hr);
+            goto fail;
+        }
+    }
+
+    /* Assembling writes every staging plane, so all or nothing. */
+    if (!b->staging_uav[0] || !b->staging_uav[1]) {
+        for (int i = 0; i < 2; i++) {
+            if (b->staging_uav[i])
+                ID3D11UnorderedAccessView_Release(b->staging_uav[i]);
+            b->staging_uav[i] = NULL;
+        }
+    }
+
+    return 0;
+
+fail:
+    ff_d3d11va_bridge_free(bridge);
+    return err;
+}
+
+void ff_d3d11va_bridge_run(FFD3D11PlaneBridge *b, ID3D11DeviceContext *ctx,
+                           ID3D11Resource *tex, unsigned index, int to_planes)
+{
+    ID3D11ShaderResourceView *null_srv = NULL;
+    ID3D11UnorderedAccessView *null_uav = NULL;
+    ID3D11ComputeShader *prev_cs = NULL;
+    ID3D11ClassInstance *prev_inst[D3D11_SHADER_MAX_INTERFACES];
+    UINT prev_inst_n = FF_ARRAY_ELEMS(prev_inst);
+    ID3D11ShaderResourceView *prev_srv = NULL;
+    ID3D11UnorderedAccessView *prev_uav = NULL;
+    D3D11_BOX box = { 0, 0, 0, b->width, b->height, 1 };
+
+    /* The context belongs to the caller, so everything the passes below bind
+     * is saved here and put back at the end. */
+    ID3D11DeviceContext_CSGetShader(ctx, &prev_cs, prev_inst, &prev_inst_n);
+    ID3D11DeviceContext_CSGetShaderResources(ctx, 0, 1, &prev_srv);
+    ID3D11DeviceContext_CSGetUnorderedAccessViews(ctx, 0, 1, &prev_uav);
+
+    if (to_planes)
+        ID3D11DeviceContext_CopySubresourceRegion(ctx,
+            (ID3D11Resource *)b->staging, 0, 0, 0, 0, tex, index, &box);
+
+    for (int i = 0; i < 2; i++) {
+        ID3D11DeviceContext_CSSetShader(ctx, b->cs[i], NULL, 0);
+        ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 1,
+            to_planes ? &b->staging_srv[i] : &b->plane_srv[i]);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1,
+            to_planes ? &b->plane_uav[i] : &b->staging_uav[i], NULL);
+        ID3D11DeviceContext_Dispatch(ctx, (b->plane_w[i] + 7) / 8,
+                                     (b->plane_h[i] + 7) / 8, 1);
+        /* Unbind before the next pass: two views of one resource cannot be
+         * bound as input and output at the same time. */
+        ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 1, &null_srv);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &null_uav,
+                                                      NULL);
+    }
+
+    ID3D11DeviceContext_CSSetShader(ctx, prev_cs, prev_inst, prev_inst_n);
+    ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 1, &prev_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &prev_uav, NULL);
+    if (prev_cs)
+        ID3D11ComputeShader_Release(prev_cs);
+    for (UINT i = 0; i < prev_inst_n; i++)
+        ID3D11ClassInstance_Release(prev_inst[i]);
+    if (prev_srv)
+        ID3D11ShaderResourceView_Release(prev_srv);
+    if (prev_uav)
+        ID3D11UnorderedAccessView_Release(prev_uav);
+
+    if (!to_planes)
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, tex, index, 0, 0, 0,
+            (ID3D11Resource *)b->staging, 0, NULL);
 }
 
 #endif /* CONFIG_VULKAN || CONFIG_CUDA */

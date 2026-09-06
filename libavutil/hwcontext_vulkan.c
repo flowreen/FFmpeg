@@ -3067,16 +3067,21 @@ typedef struct D3D11SyncState {
     uint64_t               vk_point; /* point the last submitted Vulkan copy
                                       * signals, 0 before the first transfer */
 
-    /* What Vulkan imports is a shared texture of this code's own, created
+    /* What Vulkan imports are shared textures of this code's own, created
      * and imported once per paired device and kept; D3D11 copies move the
-     * frame between it and the frame texture. So neither the frame
+     * frame between them and the frame texture. So neither the frame
      * texture's sharing, of which D3D11 documents a single handle creation
      * per texture, nor its subresource layout or lifetime matter to the
-     * import. shared_lock serializes the transfers that use it. */
+     * import. Single-plane frames go through one texture in their format,
+     * two-plane frames through the plane bridge implemented by
+     * hwcontext_d3d11va (see hwcontext_d3d11va_internal.h). shared_lock
+     * serializes the transfers that use them. */
     pthread_mutex_t     shared_lock;
     int                 shared_status; /* 0 untried, 1 ready, else error */
-    ID3D11Texture2D    *tex;
+    ID3D11Texture2D    *tex;           /* single-plane frames */
     D3D11Import         tex_import;
+    FFD3D11PlaneBridge *bridge;        /* two-plane frames */
+    D3D11Import         plane_import[2];
 } D3D11SyncState;
 
 static void d3d11_import_free(AVHWFramesContext *hwfc, D3D11Import *im)
@@ -3099,6 +3104,9 @@ static void d3d11_shared_free(AVHWFramesContext *hwfc, D3D11SyncState *sync)
     if (sync->tex)
         ID3D11Texture2D_Release(sync->tex);
     sync->tex = NULL;
+    for (int i = 0; i < 2; i++)
+        d3d11_import_free(hwfc, &sync->plane_import[i]);
+    ff_d3d11va_bridge_free(&sync->bridge);
 }
 
 static void d3d11_sync_states_free(AVHWFramesContext *hwfc)
@@ -5282,6 +5290,10 @@ static VkFormat d3d11_to_vulkan_fmt(DXGI_FORMAT f)
     case DXGI_FORMAT_R10G10B10A2_UNORM:
         return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case DXGI_FORMAT_R8_UNORM:           return VK_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_R8G8_UNORM:         return VK_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16_UNORM:          return VK_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R16G16_UNORM:       return VK_FORMAT_R16G16_UNORM;
     default:                             return VK_FORMAT_UNDEFINED;
     }
 }
@@ -5685,17 +5697,17 @@ fail:
     return err;
 }
 
-/* Create and import the shared texture for the frames context's format,
+/* Create and import the shared textures for the frames context's format,
  * once per paired device. An attempt that found the two APIs unable to
  * share is remembered, so it is not retried every frame. Any other
  * failure, running out of memory above all, may not repeat, so what the
  * attempt did create is released and the next transfer starts over, with
- * a texture whose sharing handle has not been created yet. */
+ * textures whose sharing handles have not been created yet. */
 static int d3d11_shared_get(AVHWFramesContext *hwfc, D3D11SyncState *sync,
                             AVD3D11VADeviceContext *d3d_hw)
 {
     VulkanFramesPriv *fp = hwfc->hwctx;
-    DXGI_FORMAT fmt;
+    const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     int err;
 
     pthread_mutex_lock(&fp->d3d11_sync_lock);
@@ -5703,13 +5715,23 @@ static int d3d11_shared_get(AVHWFramesContext *hwfc, D3D11SyncState *sync,
         err = sync->shared_status > 0 ? 0 : sync->shared_status;
         goto end;
     }
-    err = ff_d3d11va_texture_format(hwfc->sw_format, &fmt);
-    if (!err)
-        err = ff_d3d11va_shared_texture_create(d3d_hw->device, hwfc->width,
-                                               hwfc->height, fmt, 0,
-                                               &sync->tex, hwfc);
-    if (!err)
-        err = d3d11_import(hwfc, sync->tex, &sync->tex_import);
+    if (planes == 1) {
+        DXGI_FORMAT fmt;
+        err = ff_d3d11va_texture_format(hwfc->sw_format, &fmt);
+        if (!err)
+            err = ff_d3d11va_shared_texture_create(d3d_hw->device,
+                                                   hwfc->width, hwfc->height,
+                                                   fmt, 0, &sync->tex, hwfc);
+        if (!err)
+            err = d3d11_import(hwfc, sync->tex, &sync->tex_import);
+    } else {
+        err = ff_d3d11va_bridge_create(&sync->bridge, d3d_hw->device,
+                                       hwfc->width, hwfc->height,
+                                       hwfc->sw_format, hwfc);
+        for (int i = 0; !err && i < 2; i++)
+            err = d3d11_import(hwfc, sync->bridge->planes[i],
+                               &sync->plane_import[i]);
+    }
     if (err < 0)
         d3d11_shared_free(hwfc, sync);
     if (err == AVERROR(ENOSYS) || err >= 0)
@@ -5733,17 +5755,18 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
     AVVkFrame *hwf_vk = (AVVkFrame *)hwf->data[0];
     ID3D11Resource *tex = (ID3D11Resource *)d3df->data[0];
     UINT index = (UINT)(intptr_t)d3df->data[1];
+    const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(hwfc->sw_format);
+    const int nb_images = ff_vk_count_images(hwf_vk);
     AVHWFramesContext *d3d_fc;
     AVD3D11VADeviceContext *d3d_hw;
-    VkImageMemoryBarrier2 img_bar[AV_NUM_DATA_POINTERS + 1];
+    VkImageMemoryBarrier2 img_bar[AV_NUM_DATA_POINTERS + 2];
     int nb_img_bar = 0;
-    VkImageCopy region;
     D3D11SyncState *sync;
     D3D11_TEXTURE2D_DESC desc;
     D3D11_BOX box = { 0, 0, 0, hwfc->width, hwfc->height, 1 };
     DXGI_FORMAT fmt;
-    VkImage imp_img;
+    VkImage imp_img[2];
     uint64_t sync_point, vk_point;
     FFVkExecContext *exec;
     VkCommandBuffer cmd_buf;
@@ -5763,16 +5786,16 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
 
     /* The D3D11 copies address the frame-sized region of the texture, which
      * decoders often pad, and its subresource by array slice, which is only
-     * its index in a texture without mip levels. Only single plane formats
-     * qualify: no D3D11 copy can address the planes of a planar texture,
-     * and packed subsampled formats constrain copy regions in ways this
-     * code does not track. The texture must really be in the format the sw
-     * format implies, or the copies would silently move nothing. A
-     * keyed-mutex texture is only coherent for a user that acquires the
-     * mutex, which this code does not do. */
+     * its index in a texture without mip levels; copies of video formats
+     * only accept aligned regions, and packed subsampled formats constrain
+     * them in ways this code does not track. The texture must really be in
+     * the format the sw format implies, or the copies would silently move
+     * nothing. A keyed-mutex texture is only coherent for a user that
+     * acquires the mutex, which this code does not do. */
     ID3D11Texture2D_GetDesc((ID3D11Texture2D *)tex, &desc);
-    if (av_pix_fmt_count_planes(hwfc->sw_format) != 1 ||
-        pixdesc->log2_chroma_w || pixdesc->log2_chroma_h ||
+    if (planes < 1 || planes > 2 ||
+        (planes == 1 && (pixdesc->log2_chroma_w || pixdesc->log2_chroma_h)) ||
+        (planes == 2 && ((hwfc->width | hwfc->height) & 1)) ||
         ff_d3d11va_texture_format(hwfc->sw_format, &fmt) < 0 ||
         desc.Format != fmt ||
         desc.Width < hwfc->width || desc.Height < hwfc->height ||
@@ -5787,17 +5810,26 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
     err = d3d11_shared_get(hwfc, sync, d3d_hw);
     if (err < 0)
         return err;
+    /* Downloads write the bridge's staging texture through views its format
+     * does not support everywhere. */
+    if (planes == 2 && !upload && !sync->bridge->staging_uav[0])
+        return AVERROR(ENOSYS);
 
     pthread_mutex_lock(&sync->shared_lock);
-    imp_img = sync->tex_import.img;
+    if (planes == 1) {
+        imp_img[0] = sync->tex_import.img;
+    } else {
+        imp_img[0] = sync->plane_import[0].img;
+        imp_img[1] = sync->plane_import[1].img;
+    }
 
-    /* Stage the frame in the shared texture, and signal the fence after the
+    /* Stage the frame in the shared textures, and signal the fence after the
      * D3D11 commands that produced the texture or, for a download, that may
-     * still be reading the shared texture about to be overwritten. The copy
+     * still be reading the shared textures about to be overwritten. The copy
      * below waits for that point on the imported side, so it is ordered
      * against D3D11 work without blocking the CPU. The Vulkan copy signals
      * the next point when it is done, and the D3D11 context waits for that
-     * before it touches the shared texture again, so neither side waits on
+     * before it touches the shared textures again, so neither side waits on
      * the CPU. It also keeps the fence value growing: every D3D11 signal is
      * queued behind the previous Vulkan signal. */
     d3d_hw->lock(d3d_hw->lock_ctx);
@@ -5811,9 +5843,14 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
             goto end;
         }
     }
-    if (upload)
-        ID3D11DeviceContext_CopySubresourceRegion(d3d_hw->device_context,
-            (ID3D11Resource *)sync->tex, 0, 0, 0, 0, tex, index, &box);
+    if (upload) {
+        if (planes == 2)
+            ff_d3d11va_bridge_run(sync->bridge, d3d_hw->device_context,
+                                  tex, index, 1);
+        else
+            ID3D11DeviceContext_CopySubresourceRegion(d3d_hw->device_context,
+                (ID3D11Resource *)sync->tex, 0, 0, 0, 0, tex, index, &box);
+    }
     sync_point = ++sync->value;
     hr = ID3D11DeviceContext4_Signal(sync->ctx4, sync->fence, sync_point);
     ID3D11DeviceContext_Flush(d3d_hw->device_context);
@@ -5856,31 +5893,33 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
                         p->nb_img_qfs > 1 ? VK_QUEUE_FAMILY_IGNORED
                                           : p->img_qfs[0]);
 
-    /* Acquire the imported image from the external owner. When we are reading
-     * it, the contents D3D11 left behind have to be preserved, so it cannot
-     * be acquired from VK_IMAGE_LAYOUT_UNDEFINED. */
-    img_bar[nb_img_bar++] = (VkImageMemoryBarrier2) {
-        .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        .srcAccessMask = 0,
-        .dstAccessMask = upload ? VK_ACCESS_2_TRANSFER_READ_BIT :
-                                  VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .oldLayout     = upload ? VK_IMAGE_LAYOUT_GENERAL :
-                                  VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout     = upload ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
-                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        /* This is an ownership acquire, so the destination has to be the
-         * queue family the command buffer itself was allocated from. */
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
-        .dstQueueFamilyIndex = exec->qf,
-        .image               = imp_img,
-        .subresourceRange    = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-        },
-    };
+    /* Acquire the imported images from the external owner. When we are
+     * reading them, the contents D3D11 left behind have to be preserved, so
+     * they cannot be acquired from VK_IMAGE_LAYOUT_UNDEFINED. */
+    for (int i = 0; i < planes; i++) {
+        img_bar[nb_img_bar++] = (VkImageMemoryBarrier2) {
+            .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = 0,
+            .dstAccessMask = upload ? VK_ACCESS_2_TRANSFER_READ_BIT :
+                                      VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .oldLayout     = upload ? VK_IMAGE_LAYOUT_GENERAL :
+                                      VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout     = upload ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            /* This is an ownership acquire, so the destination has to be the
+             * queue family the command buffer itself was allocated from. */
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = exec->qf,
+            .image               = imp_img[i],
+            .subresourceRange    = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+    }
 
     vk->CmdPipelineBarrier2(cmd_buf, &(VkDependencyInfo) {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
@@ -5888,49 +5927,69 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
             .imageMemoryBarrierCount = nb_img_bar,
         });
 
-    region = (VkImageCopy) {
-        .srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .layerCount = 1 },
-        .dstSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .layerCount = 1 },
-        .extent         = { hwfc->width, hwfc->height, 1 },
-    };
-    if (upload)
-        vk->CmdCopyImage(cmd_buf, imp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         hwf_vk->img[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         1, &region);
-    else
-        vk->CmdCopyImage(cmd_buf, hwf_vk->img[0],
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         imp_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         1, &region);
+    /* One copy per plane. The frame may hold one image per plane or a single
+     * multi-planar image addressed through plane aspects, so the aspect comes
+     * from the frame and the image index is clamped to what it has. */
+    for (int i = 0; i < planes; i++) {
+        const int img_idx = FFMIN(i, nb_images - 1);
+        VkImageAspectFlags aspect = ff_vk_aspect_flag(hwf, i);
+        uint32_t p_w, p_h;
+        VkImageCopy region;
 
-    /* Release the imported image back to the external owner, which makes the
-     * write available to D3D11 when this was a download. */
-    img_bar[0] = (VkImageMemoryBarrier2) {
-        .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .srcAccessMask = upload ? VK_ACCESS_2_TRANSFER_READ_BIT :
-                                  VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dstAccessMask = 0,
-        .oldLayout     = upload ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
-                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = exec->qf,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
-        .image               = imp_img,
-        .subresourceRange    = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-        },
-    };
+        get_plane_wh(&p_w, &p_h, hwfc->sw_format, hwfc->width, hwfc->height, i);
+
+        region = (VkImageCopy) {
+            .srcSubresource = { .layerCount = 1 },
+            .dstSubresource = { .layerCount = 1 },
+            .extent         = { p_w, p_h, 1 },
+        };
+        if (upload) {
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.dstSubresource.aspectMask = aspect;
+            vk->CmdCopyImage(cmd_buf, imp_img[i],
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             hwf_vk->img[img_idx],
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             1, &region);
+        } else {
+            region.srcSubresource.aspectMask = aspect;
+            region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vk->CmdCopyImage(cmd_buf, hwf_vk->img[img_idx],
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             imp_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             1, &region);
+        }
+    }
+
+    /* Release the imported images back to the external owner, which makes the
+     * writes available to D3D11 when this was a download. */
+    nb_img_bar = 0;
+    for (int i = 0; i < planes; i++) {
+        img_bar[nb_img_bar++] = (VkImageMemoryBarrier2) {
+            .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .srcAccessMask = upload ? VK_ACCESS_2_TRANSFER_READ_BIT :
+                                      VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstAccessMask = 0,
+            .oldLayout     = upload ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = exec->qf,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .image               = imp_img[i],
+            .subresourceRange    = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+    }
 
     vk->CmdPipelineBarrier2(cmd_buf, &(VkDependencyInfo) {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
             .pImageMemoryBarriers    = img_bar,
-            .imageMemoryBarrierCount = 1,
+            .imageMemoryBarrierCount = nb_img_bar,
         });
 
     /* The point the D3D11 side waits for, see above. */
@@ -5948,10 +6007,15 @@ static int vulkan_transfer_d3d11(AVHWFramesContext *hwfc, AVFrame *dst,
         if (!upload) {
             d3d_hw->lock(d3d_hw->lock_ctx);
             hr = ID3D11DeviceContext4_Wait(sync->ctx4, sync->fence, vk_point);
-            if (SUCCEEDED(hr))
-                ID3D11DeviceContext_CopySubresourceRegion(
-                    d3d_hw->device_context, tex, index, 0, 0, 0,
-                    (ID3D11Resource *)sync->tex, 0, NULL);
+            if (SUCCEEDED(hr)) {
+                if (planes == 2)
+                    ff_d3d11va_bridge_run(sync->bridge, d3d_hw->device_context,
+                                          tex, index, 0);
+                else
+                    ID3D11DeviceContext_CopySubresourceRegion(
+                        d3d_hw->device_context, tex, index, 0, 0, 0,
+                        (ID3D11Resource *)sync->tex, 0, NULL);
+            }
             d3d_hw->unlock(d3d_hw->lock_ctx);
             if (FAILED(hr)) {
                 av_log(hwfc, AV_LOG_ERROR,

@@ -507,13 +507,19 @@ static int cuda_transfer_get_formats(AVHWFramesContext *ctx,
                                      enum AVPixelFormat **formats)
 {
     enum AVPixelFormat *fmts;
+    int n = 0;
 
-    fmts = av_malloc_array(2, sizeof(*fmts));
+    fmts = av_malloc_array(3, sizeof(*fmts));
     if (!fmts)
         return AVERROR(ENOMEM);
 
-    fmts[0] = ctx->sw_format;
-    fmts[1] = AV_PIX_FMT_NONE;
+    fmts[n++] = ctx->sw_format;
+#if CONFIG_D3D11VA
+    /* The D3D11 route handles device memory frames only. */
+    if (ctx->format == AV_PIX_FMT_CUDA)
+        fmts[n++] = AV_PIX_FMT_D3D11;
+#endif
+    fmts[n] = AV_PIX_FMT_NONE;
 
     *formats = fmts;
 

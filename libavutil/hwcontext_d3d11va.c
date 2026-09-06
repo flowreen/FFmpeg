@@ -40,7 +40,10 @@
 #include "hwcontext_d3d11va_internal.h"
 #include "hwcontext_internal.h"
 #if CONFIG_CUDA
+#include <d3d11_4.h>
+#include "cuda_check.h"
 #include "hwcontext_cuda_internal.h"
+#define CHECK_CU(x) FF_CUDA_CHECK_DL(cuda_cu, cu, x)
 #endif
 #if CONFIG_VULKAN
 #include "hwcontext_vulkan.h"
@@ -98,7 +101,20 @@ typedef struct D3D11VAFramesContext {
     DXGI_FORMAT format;
 
     ID3D11Texture2D *staging_texture;
+
+#if CONFIG_CUDA
+    AVMutex                  cuda_lock;
+    int                      cuda_lock_init;
+    struct D3D11CudaInterop *cuda_interop;
+#endif
 } D3D11VAFramesContext;
+
+#if CONFIG_CUDA
+static int d3d11va_cuda_luid(AVCUDADeviceContext *cu_hw, LUID *luid);
+static void d3d11va_cuda_interops_free(AVHWFramesContext *ctx);
+static int d3d11va_cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
+                                      const AVFrame *src);
+#endif
 
 static const struct {
     DXGI_FORMAT d3d_format;
@@ -140,6 +156,14 @@ static void d3d11va_frames_uninit(AVHWFramesContext *ctx)
 {
     D3D11VAFramesContext *s = ctx->hwctx;
     AVD3D11VAFramesContext *frames_hwctx = &s->p;
+
+#if CONFIG_CUDA
+    d3d11va_cuda_interops_free(ctx);
+    if (s->cuda_lock_init) {
+        ff_mutex_destroy(&s->cuda_lock);
+        s->cuda_lock_init = 0;
+    }
+#endif
 
     if (frames_hwctx->texture)
         ID3D11Texture2D_Release(frames_hwctx->texture);
@@ -289,6 +313,12 @@ static int d3d11va_frames_init(AVHWFramesContext *ctx)
     HRESULT hr;
     D3D11_TEXTURE2D_DESC texDesc;
 
+#if CONFIG_CUDA
+    if (ff_mutex_init(&s->cuda_lock, NULL))
+        return AVERROR(ENOMEM);
+    s->cuda_lock_init = 1;
+#endif
+
     for (i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++) {
         if (ctx->sw_format == supported_formats[i].pix_fmt) {
             s->format = supported_formats[i].d3d_format;
@@ -381,7 +411,7 @@ static int d3d11va_transfer_get_formats(AVHWFramesContext *ctx,
     enum AVPixelFormat *fmts;
     int n = 0;
 
-    fmts = av_malloc_array(3, sizeof(*fmts));
+    fmts = av_malloc_array(4, sizeof(*fmts));
     if (!fmts)
         return AVERROR(ENOMEM);
 
@@ -390,6 +420,9 @@ static int d3d11va_transfer_get_formats(AVHWFramesContext *ctx,
         fmts[n++] = ctx->sw_format;
 #if CONFIG_VULKAN
         fmts[n++] = AV_PIX_FMT_VULKAN;
+#endif
+#if CONFIG_CUDA
+        fmts[n++] = AV_PIX_FMT_CUDA;
 #endif
     }
     fmts[n] = AV_PIX_FMT_NONE;
@@ -461,6 +494,11 @@ static int d3d11va_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
 
     if (frame->hw_frames_ctx->data != (uint8_t *)ctx)
         return AVERROR(EINVAL);
+
+#if CONFIG_CUDA
+    if (other->format == AV_PIX_FMT_CUDA)
+        return d3d11va_cuda_transfer_data(ctx, dst, src);
+#endif
 
     /* Not a transfer to or from a software frame we can handle. Report this as
      * unimplemented rather than invalid, so that a hardware to hardware
@@ -854,6 +892,653 @@ void ff_d3d11va_bridge_run(FFD3D11PlaneBridge *b, ID3D11DeviceContext *ctx,
 }
 
 #endif /* CONFIG_VULKAN || CONFIG_CUDA */
+
+#if CONFIG_CUDA
+
+/* ffnvcodec does not carry these yet; the values come from cuda.h. The
+ * FF_ prefix keeps them from clashing with the real definitions once
+ * ffnvcodec has them. */
+#define FF_CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE \
+    ((CUexternalMemoryHandleType)6)
+#define FF_CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE \
+    ((CUexternalSemaphoreHandleType)5)
+#define FF_CUDA_EXTERNAL_MEMORY_DEDICATED 0x1
+#define FF_CU_AD_FORMAT_UNORM_INT_101010_2 ((CUarray_format)0x50)
+#define FF_CUDA_ERROR_INVALID_VALUE   ((CUresult)1)
+#define FF_CUDA_ERROR_OUT_OF_MEMORY   ((CUresult)2)
+#define FF_CUDA_ERROR_INVALID_HANDLE  ((CUresult)400)
+#define FF_CUDA_ERROR_NOT_SUPPORTED   ((CUresult)801)
+
+/* CUDA shares a D3D11 texture through the external memory API: each of the
+ * private textures below is imported once as a CUDA mipmapped array, and a
+ * shared D3D11 fence, imported as a CUDA external semaphore, chains the two
+ * queues on the GPU in both directions, so no transfer ever waits on the
+ * CPU. What no CUDA sharing API can do is reach the second plane of a
+ * two-plane texture, so those frames move through the plane bridge, and
+ * single-plane frames through an intermediate texture in their own format,
+ * so the frame textures themselves, which may be recycled decoder arrays,
+ * never have to be imported. One state is kept for each CUDA context frames
+ * have been transferred to or from, created once and kept; cuda_lock
+ * serializes the transfers, which keeps the shared textures owned by one
+ * transfer at a time and the fence values increasing in submission order,
+ * which monitored fences require of their signals. The copies ride the
+ * CUDA device's stream, so the D3D11 waits they end in also depend on
+ * whatever else the application keeps on that stream. */
+typedef struct D3D11CudaInterop {
+    struct D3D11CudaInterop *next;
+    AVBufferRef        *device_ref; /* keeps the loader and the stream alive */
+    CUcontext           cuda_ctx;   /* identity of the pairing */
+    int                 status;     /* 0 untried, 1 ready, else error */
+    FFD3D11PlaneBridge *bridge;     /* two-plane formats */
+    ID3D11Texture2D    *tex;        /* single-plane intermediate */
+    ID3D11DeviceContext4 *ctx4;
+    ID3D11Fence        *fence;
+    CUexternalSemaphore sem;
+    CUstream            stream;     /* the one that set cuda_done */
+    CUexternalMemory    mem[2];
+    CUmipmappedArray    mip[2];
+    CUarray             arr[2];     /* level 0 of each texture */
+    int                 nb_planes;
+    uint64_t            fence_val;  /* last fence value handed out */
+    uint64_t            cuda_done;  /* last value CUDA was told to signal */
+} D3D11CudaInterop;
+
+/* ffnvcodec loads the external memory and semaphore entry points
+ * optionally, so a loader built against an older CUDA can leave them NULL.
+ * They are all checked before any interop state is created, so a teardown
+ * never has to cope with imports that could not have been made. */
+static int d3d11va_cuda_interop_available(CudaFunctions *cu)
+{
+    return cu->cuImportExternalMemory && cu->cuDestroyExternalMemory &&
+           cu->cuExternalMemoryGetMappedMipmappedArray &&
+           cu->cuMipmappedArrayGetLevel && cu->cuMipmappedArrayDestroy &&
+           cu->cuImportExternalSemaphore && cu->cuDestroyExternalSemaphore &&
+           cu->cuSignalExternalSemaphoresAsync &&
+           cu->cuWaitExternalSemaphoresAsync;
+}
+
+/* Only a lack of interoperability, reported as ENOSYS, condemns the pairing
+ * below. Running out of memory is worth retrying, and the import functions
+ * are documented to fail for reasons unrelated to what is being imported,
+ * an operating system call or an earlier asynchronous error, which say
+ * nothing about the pairing either. */
+static int d3d11va_cuda_cu_err(CUresult ret)
+{
+    switch (ret) {
+    case FF_CUDA_ERROR_OUT_OF_MEMORY:
+        return AVERROR(ENOMEM);
+    case FF_CUDA_ERROR_INVALID_VALUE:
+    case FF_CUDA_ERROR_INVALID_HANDLE:
+    case FF_CUDA_ERROR_NOT_SUPPORTED:
+        return AVERROR(ENOSYS);
+    default:
+        return AVERROR_EXTERNAL;
+    }
+}
+
+/* Release everything a pairing created, imports included, leaving the
+ * pairing itself in place. */
+static void d3d11va_cuda_interop_release(AVHWFramesContext *ctx,
+                                         D3D11CudaInterop *ci)
+{
+    AVHWDeviceContext *dev_ctx = (AVHWDeviceContext *)ci->device_ref->data;
+    AVCUDADeviceContext *cu_hw = dev_ctx->hwctx;
+    CudaFunctions *cu = cu_hw->internal->cuda_dl;
+    CUcontext dummy;
+
+    if (ci->sem || ci->mem[0] || ci->mem[1]) {
+        if (cu->cuCtxPushCurrent(ci->cuda_ctx) == CUDA_SUCCESS) {
+            /* Transfers do not wait for their copies, so make sure none is
+             * still using the imports about to go away. Every transfer
+             * opens with a D3D11 wait for the value the previous one
+             * signals, and its copies only run after the signal that
+             * follows that wait, so they are ordered behind all earlier
+             * copies whichever streams those used. Synchronizing the last
+             * stream therefore drains them all. That stream is NULL for the
+             * default stream, so what tells a transfer happened is the
+             * value it signaled. */
+            if (ci->cuda_done)
+                cu->cuStreamSynchronize(ci->stream);
+            if (ci->sem)
+                cu->cuDestroyExternalSemaphore(ci->sem);
+            for (int i = 0; i < FF_ARRAY_ELEMS(ci->mem); i++) {
+                if (ci->mip[i])
+                    cu->cuMipmappedArrayDestroy(ci->mip[i]);
+                if (ci->mem[i])
+                    cu->cuDestroyExternalMemory(ci->mem[i]);
+            }
+            cu->cuCtxPopCurrent(&dummy);
+        } else {
+            av_log(ctx, AV_LOG_WARNING, "The CUDA context is gone; its "
+                   "imports leak, and in-flight copies cannot be waited "
+                   "out\n");
+        }
+    }
+    ci->sem = NULL;
+    memset(ci->mem, 0, sizeof(ci->mem));
+    memset(ci->mip, 0, sizeof(ci->mip));
+    memset(ci->arr, 0, sizeof(ci->arr));
+    ci->stream    = NULL;
+    ci->cuda_done = 0;
+    ci->fence_val = 0;
+    ci->nb_planes = 0;
+    ff_d3d11va_bridge_free(&ci->bridge);
+    if (ci->tex)
+        ID3D11Texture2D_Release(ci->tex);
+    ci->tex = NULL;
+    if (ci->fence)
+        ID3D11Fence_Release(ci->fence);
+    ci->fence = NULL;
+    if (ci->ctx4)
+        ID3D11DeviceContext4_Release(ci->ctx4);
+    ci->ctx4 = NULL;
+}
+
+static void d3d11va_cuda_interops_free(AVHWFramesContext *ctx)
+{
+    D3D11VAFramesContext *s = ctx->hwctx;
+    D3D11CudaInterop *ci = s->cuda_interop;
+
+    while (ci) {
+        D3D11CudaInterop *next = ci->next;
+        d3d11va_cuda_interop_release(ctx, ci);
+        av_buffer_unref(&ci->device_ref);
+        av_free(ci);
+        ci = next;
+    }
+    s->cuda_interop = NULL;
+}
+
+/* The CUDA array layout of each texture format: an import has to describe
+ * the texture the way the exporting API does. */
+static const struct {
+    DXGI_FORMAT d3d_format;
+    CUarray_format format;
+    int channels;
+    int texel; /* bytes */
+} cuda_array_formats[] = {
+    { DXGI_FORMAT_R8_UNORM, CU_AD_FORMAT_UNSIGNED_INT8, 1, 1 },
+    { DXGI_FORMAT_R8G8_UNORM, CU_AD_FORMAT_UNSIGNED_INT8, 2, 2 },
+    { DXGI_FORMAT_R16_UNORM, CU_AD_FORMAT_UNSIGNED_INT16, 1, 2 },
+    { DXGI_FORMAT_R16G16_UNORM, CU_AD_FORMAT_UNSIGNED_INT16, 2, 4 },
+    { DXGI_FORMAT_B8G8R8A8_UNORM, CU_AD_FORMAT_UNSIGNED_INT8, 4, 4 },
+    { DXGI_FORMAT_R8G8B8A8_UNORM, CU_AD_FORMAT_UNSIGNED_INT8, 4, 4 },
+    { DXGI_FORMAT_R10G10B10A2_UNORM, FF_CU_AD_FORMAT_UNORM_INT_101010_2, 4, 4 },
+    { DXGI_FORMAT_R16G16B16A16_FLOAT, CU_AD_FORMAT_HALF, 4, 8 },
+};
+
+/* Import one of our own textures, which is NT handle shared, as a CUDA
+ * array. */
+static int d3d11va_cuda_import_texture(CudaFunctions *cu,
+                                       ID3D11Texture2D *tex,
+                                       CUexternalMemory *mem,
+                                       CUmipmappedArray *mip, CUarray *arr)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    CUDA_EXTERNAL_MEMORY_HANDLE_DESC mdesc;
+    CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC adesc;
+    CUarray_format format = 0;
+    int channels = 0, texel = 0;
+    IDXGIResource1 *res1;
+    HANDLE handle;
+    HRESULT hr;
+    CUresult ret;
+
+    ID3D11Texture2D_GetDesc(tex, &desc);
+    for (int i = 0; i < FF_ARRAY_ELEMS(cuda_array_formats); i++) {
+        if (cuda_array_formats[i].d3d_format == desc.Format) {
+            format   = cuda_array_formats[i].format;
+            channels = cuda_array_formats[i].channels;
+            texel    = cuda_array_formats[i].texel;
+            break;
+        }
+    }
+    /* KMT handles import into CUDA without an error, and then every access
+     * faults. */
+    if (!channels || !(desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
+        return AVERROR(ENOSYS);
+
+    /* D3D11 never reports the size of a texture's allocation, and NVIDIA
+     * documents no value for D3D11 resources, so the size given is that of
+     * the texels, tightly packed: a lower bound, not the real size. A
+     * dedicated import is bound to the resource, whose real allocation the
+     * driver can see, and the NVIDIA driver, the only implementation, has
+     * accepted this size on every driver this code was tested with. */
+    mdesc = (CUDA_EXTERNAL_MEMORY_HANDLE_DESC) {
+        .type  = FF_CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE,
+        .size  = (uint64_t)desc.Width * desc.Height * texel,
+        .flags = FF_CUDA_EXTERNAL_MEMORY_DEDICATED,
+    };
+    hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1,
+                                        (void **)&res1);
+    if (FAILED(hr))
+        return AVERROR(ENOSYS);
+    hr = IDXGIResource1_CreateSharedHandle(res1, NULL,
+                                           DXGI_SHARED_RESOURCE_READ |
+                                           DXGI_SHARED_RESOURCE_WRITE,
+                                           NULL, &handle);
+    IDXGIResource1_Release(res1);
+    /* The handle says nothing about what the pairing can do, so its failure
+     * is not remembered, unlike the import's below. */
+    if (FAILED(hr))
+        return hr == E_OUTOFMEMORY ? AVERROR(ENOMEM) : AVERROR_EXTERNAL;
+    mdesc.handle.win32.handle = handle;
+    ret = cu->cuImportExternalMemory(mem, &mdesc);
+    CloseHandle(handle);
+    if (ret != CUDA_SUCCESS)
+        return d3d11va_cuda_cu_err(ret);
+
+    adesc = (CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC) {
+        .arrayDesc = {
+            .Width       = desc.Width,
+            .Height      = desc.Height,
+            .Format      = format,
+            .NumChannels = channels,
+        },
+        .numLevels = 1,
+    };
+    ret = cu->cuExternalMemoryGetMappedMipmappedArray(mip, *mem, &adesc);
+    if (ret != CUDA_SUCCESS)
+        return d3d11va_cuda_cu_err(ret);
+
+    ret = cu->cuMipmappedArrayGetLevel(arr, *mip, 0);
+    if (ret != CUDA_SUCCESS)
+        return d3d11va_cuda_cu_err(ret);
+    return 0;
+}
+
+/* The imports below need the CUDA context on the adapter the D3D11 device
+ * runs on, and the driver documents no particular error for a handle from
+ * another one, so the two are compared up front, by LUID like the device
+ * derivation does. Returns 1 when they are known to differ; when either
+ * LUID cannot be obtained, the import itself has to tell. */
+static int d3d11va_cuda_other_adapter(AVHWFramesContext *ctx,
+                                      AVCUDADeviceContext *cu_hw)
+{
+    AVD3D11VADeviceContext *hwctx = ctx->device_ctx->hwctx;
+    IDXGIDevice *dxgi_dev;
+    IDXGIAdapter *adapter;
+    DXGI_ADAPTER_DESC desc;
+    LUID luid;
+    HRESULT hr;
+
+    if (d3d11va_cuda_luid(cu_hw, &luid) < 0)
+        return 0;
+
+    hr = ID3D11Device_QueryInterface(hwctx->device, &IID_IDXGIDevice,
+                                     (void **)&dxgi_dev);
+    if (FAILED(hr))
+        return 0;
+    hr = IDXGIDevice_GetAdapter(dxgi_dev, &adapter);
+    IDXGIDevice_Release(dxgi_dev);
+    if (FAILED(hr))
+        return 0;
+    hr = IDXGIAdapter_GetDesc(adapter, &desc);
+    IDXGIAdapter_Release(adapter);
+    if (FAILED(hr))
+        return 0;
+
+    return desc.AdapterLuid.LowPart  != luid.LowPart ||
+           desc.AdapterLuid.HighPart != luid.HighPart;
+}
+
+/* Find or create the state for this CUDA context, cuda_lock held. An
+ * attempt that found the two unable to share is kept, so it is not retried
+ * every frame; any other failure releases what the attempt created, and
+ * the next transfer starts over. */
+static int d3d11va_cuda_interop_get(AVHWFramesContext *ctx,
+                                    AVHWFramesContext *cuda_fc,
+                                    D3D11CudaInterop **out)
+{
+    D3D11VAFramesContext *s = ctx->hwctx;
+    AVD3D11VADeviceContext *hwctx = ctx->device_ctx->hwctx;
+    AVCUDADeviceContext *cu_hw = cuda_fc->device_ctx->hwctx;
+    CudaFunctions *cu = cu_hw->internal->cuda_dl;
+    const int planes = av_pix_fmt_count_planes(ctx->sw_format);
+    ID3D11Texture2D *plane_tex[2];
+    D3D11CudaInterop *ci;
+    ID3D11Device5 *dev5;
+    CUcontext dummy;
+    HANDLE handle;
+    HRESULT hr;
+    int err;
+
+    for (ci = s->cuda_interop; ci; ci = ci->next)
+        if (ci->cuda_ctx == cu_hw->cuda_ctx)
+            break;
+
+    if (!ci) {
+        ci = av_mallocz(sizeof(*ci));
+        if (!ci)
+            return AVERROR(ENOMEM);
+        ci->cuda_ctx   = cu_hw->cuda_ctx;
+        ci->device_ref = av_buffer_ref(cuda_fc->device_ref);
+        if (!ci->device_ref) {
+            av_free(ci);
+            return AVERROR(ENOMEM);
+        }
+        ci->next = s->cuda_interop;
+        s->cuda_interop = ci;
+    }
+    if (ci->status) {
+        *out = ci;
+        return ci->status > 0 ? 0 : ci->status;
+    }
+
+    if (d3d11va_cuda_other_adapter(ctx, cu_hw)) {
+        av_log(ctx, AV_LOG_DEBUG, "The CUDA context is on another adapter\n");
+        err = AVERROR(ENOSYS);
+        goto fail;
+    }
+
+    if (planes == 2) {
+        err = ff_d3d11va_bridge_create(&ci->bridge, hwctx->device,
+                                       ctx->width, ctx->height,
+                                       ctx->sw_format, ctx);
+        if (err < 0)
+            goto fail;
+        plane_tex[0] = ci->bridge->planes[0];
+        plane_tex[1] = ci->bridge->planes[1];
+        ci->nb_planes = 2;
+    } else {
+        err = ff_d3d11va_shared_texture_create(hwctx->device, ctx->width,
+                                               ctx->height, s->format, 0,
+                                               &ci->tex, ctx);
+        if (err < 0)
+            goto fail;
+        plane_tex[0] = ci->tex;
+        ci->nb_planes = 1;
+    }
+
+    hr = ID3D11Device_QueryInterface(hwctx->device, &IID_ID3D11Device5,
+                                     (void **)&dev5);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device5_CreateFence(dev5, 0, D3D11_FENCE_FLAG_SHARED,
+                                       &IID_ID3D11Fence, (void **)&ci->fence);
+        ID3D11Device5_Release(dev5);
+    }
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_DEBUG, "Cannot create a shared fence (%lx)\n",
+               (long)hr);
+        err = ff_d3d11va_hr_err(hr);
+        goto fail;
+    }
+    hwctx->lock(hwctx->lock_ctx);
+    hr = ID3D11DeviceContext_QueryInterface(hwctx->device_context,
+                                            &IID_ID3D11DeviceContext4,
+                                            (void **)&ci->ctx4);
+    hwctx->unlock(hwctx->lock_ctx);
+    if (FAILED(hr)) {
+        err = AVERROR(ENOSYS);
+        goto fail;
+    }
+
+    /* The adapters were compared above where the driver allowed it, so
+     * what the imports fail on is a pairing the two APIs cannot share,
+     * reported as ENOSYS and remembered, or something transient, which the
+     * next transfer retries. */
+    if (cu->cuCtxPushCurrent(ci->cuda_ctx) != CUDA_SUCCESS) {
+        err = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    hr = ID3D11Fence_CreateSharedHandle(ci->fence, NULL, GENERIC_ALL,
+                                        NULL, &handle);
+    if (SUCCEEDED(hr)) {
+        CUresult ret;
+        CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC sdesc = {
+            .type = FF_CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE,
+            .handle.win32.handle = handle,
+        };
+        ret = cu->cuImportExternalSemaphore(&ci->sem, &sdesc);
+        err = ret == CUDA_SUCCESS ? 0 : d3d11va_cuda_cu_err(ret);
+        CloseHandle(handle);
+    } else {
+        /* Like the texture handles: nothing the pairing can be blamed for. */
+        err = hr == E_OUTOFMEMORY ? AVERROR(ENOMEM) : AVERROR_EXTERNAL;
+    }
+    for (int i = 0; err >= 0 && i < ci->nb_planes; i++)
+        err = d3d11va_cuda_import_texture(cu, plane_tex[i], &ci->mem[i],
+                                          &ci->mip[i], &ci->arr[i]);
+    cu->cuCtxPopCurrent(&dummy);
+    if (err < 0) {
+        av_log(ctx, AV_LOG_DEBUG, "Cannot import a texture into CUDA\n");
+        goto fail;
+    }
+
+    ci->status = 1;
+    *out = ci;
+    return 0;
+
+fail:
+    /* Whatever the attempt created is released, so that a retry starts
+     * over, with textures whose sharing handles have not been created yet:
+     * D3D11 documents a single creation per texture. Only a lack of
+     * interoperability is worth remembering. Running out of memory, and
+     * whatever the driver blames on something other than what is being
+     * imported, may not repeat, so the next transfer retries. */
+    d3d11va_cuda_interop_release(ctx, ci);
+    if (err == AVERROR(ENOSYS))
+        ci->status = err;
+    *out = ci;
+    return err;
+}
+
+static int d3d11va_cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
+                                      const AVFrame *src)
+{
+    D3D11VAFramesContext *s = ctx->hwctx;
+    AVD3D11VADeviceContext *hwctx = ctx->device_ctx->hwctx;
+    const int to_cuda = dst->format == AV_PIX_FMT_CUDA;
+    const AVFrame *cudaf = to_cuda ? dst : src;
+    const AVFrame *d3df  = to_cuda ? src : dst;
+    ID3D11Resource *tex = (ID3D11Resource *)d3df->data[0];
+    UINT index = (UINT)(intptr_t)d3df->data[1];
+    const int planes = av_pix_fmt_count_planes(ctx->sw_format);
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(ctx->sw_format);
+    /* Like the system memory paths, only the common region is copied; with
+     * differing sizes the margin keeps whatever the long-lived intermediate
+     * textures held before, and those are sized by the frames context. */
+    int w = FFMIN3(dst->width,  src->width,  ctx->width);
+    int h = FFMIN3(dst->height, src->height, ctx->height);
+    AVHWFramesContext *cuda_fc;
+    AVHWDeviceContext *cuda_cu;
+    AVCUDADeviceContext *cu_hw;
+    CudaFunctions *cu;
+    D3D11CudaInterop *ci;
+    D3D11_TEXTURE2D_DESC desc;
+    D3D11_BOX box = { 0, 0, 0, ctx->width, ctx->height, 1 };
+    CUcontext dummy;
+    uint64_t v1, v2;
+    HRESULT hr;
+    int ret;
+
+    if (!cudaf->hw_frames_ctx)
+        return AVERROR(ENOSYS);
+    cuda_fc = (AVHWFramesContext *)cudaf->hw_frames_ctx->data;
+    if (cuda_fc->format != AV_PIX_FMT_CUDA)
+        return AVERROR(ENOSYS);
+    cuda_cu = cuda_fc->device_ctx;
+    cu_hw   = cuda_fc->device_ctx->hwctx;
+    cu      = cu_hw->internal->cuda_dl;
+
+    /* The copy moves bits, so the two sides have to agree on what the bits
+     * mean, and there is no way to address the planes of more of them.
+     * Packed subsampled formats are also out: their textures constrain the
+     * copy regions in ways this code does not track. */
+    if (cuda_fc->sw_format != ctx->sw_format || planes < 1 || planes > 2 ||
+        (planes == 1 && (pixdesc->log2_chroma_w || pixdesc->log2_chroma_h)))
+        return AVERROR(ENOSYS);
+
+    /* The staging copies address the frame-sized region of the texture,
+     * which decoders often pad, and copies of video formats only accept
+     * aligned regions. They address the subresource by array slice, which
+     * is only its index in a texture without mip levels. The texture must
+     * really be in the format the sw format implies, or the copies would
+     * silently move nothing. A keyed-mutex texture is only coherent for a
+     * user that acquires the mutex, which this code does not do. */
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)tex, &desc);
+    if (desc.Width < ctx->width || desc.Height < ctx->height ||
+        desc.SampleDesc.Count != 1 || desc.MipLevels != 1 ||
+        index >= desc.ArraySize ||
+        (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+        return AVERROR(ENOSYS);
+    if (planes == 2) {
+        DXGI_FORMAT tex_fmt, plane_fmts[2];
+        if (((ctx->width | ctx->height) & 1) ||
+            ff_d3d11va_bridge_formats(ctx->sw_format, &tex_fmt,
+                                      plane_fmts) < 0 ||
+            desc.Format != tex_fmt)
+            return AVERROR(ENOSYS);
+    } else {
+        /* Formats no CUDA array layout matches are rejected before the
+         * interop state allocates anything for them. */
+        int i;
+        for (i = 0; i < FF_ARRAY_ELEMS(cuda_array_formats); i++)
+            if (cuda_array_formats[i].d3d_format == s->format)
+                break;
+        if (desc.Format != s->format ||
+            i == FF_ARRAY_ELEMS(cuda_array_formats))
+            return AVERROR(ENOSYS);
+    }
+
+    /* Without the optional entry points nothing can be imported, so no
+     * interop state is created for this pairing either. */
+    if (!d3d11va_cuda_interop_available(cu))
+        return AVERROR(ENOSYS);
+
+    ff_mutex_lock(&s->cuda_lock);
+
+    ret = d3d11va_cuda_interop_get(ctx, cuda_fc, &ci);
+    if (ret < 0)
+        goto end;
+    /* Assembling a frame writes the staging texture through views its format
+     * does not support everywhere. */
+    if (planes == 2 && !to_cuda && !ci->bridge->staging_uav[0]) {
+        ret = AVERROR(ENOSYS);
+        goto end;
+    }
+
+    v1 = ++ci->fence_val;
+    v2 = ++ci->fence_val;
+
+    hwctx->lock(hwctx->lock_ctx);
+    /* The last transfer returned while its copies could still be touching
+     * these textures; the wait orders whatever comes next after them, on
+     * the GPU. Failures have to surface before anything crosses the APIs:
+     * CUDA waiting on a signal that never got submitted would block its
+     * stream for good. */
+    hr = ID3D11DeviceContext4_Wait(ci->ctx4, ci->fence, ci->cuda_done);
+    if (SUCCEEDED(hr) && to_cuda) {
+        if (planes == 2)
+            ff_d3d11va_bridge_run(ci->bridge, hwctx->device_context, tex,
+                                  index, 1);
+        else
+            ID3D11DeviceContext_CopySubresourceRegion(hwctx->device_context,
+                (ID3D11Resource *)ci->tex, 0, 0, 0, 0, tex, index, &box);
+    }
+    /* The signal orders all D3D11 work issued so far ahead of the CUDA
+     * copies, whether it staged the frame or still reads the textures from
+     * an earlier download; the flush submits it, or CUDA would wait on
+     * work still sitting in the command buffer. */
+    if (SUCCEEDED(hr))
+        hr = ID3D11DeviceContext4_Signal(ci->ctx4, ci->fence, v1);
+    ID3D11DeviceContext_Flush(hwctx->device_context);
+    hwctx->unlock(hwctx->lock_ctx);
+    if (FAILED(hr)) {
+        ret = AVERROR_EXTERNAL;
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuCtxPushCurrent(ci->cuda_ctx));
+    if (ret < 0)
+        goto end;
+
+    {
+        CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait = {
+            .params.fence.value = v1,
+        };
+        ret = CHECK_CU(cu->cuWaitExternalSemaphoresAsync(&ci->sem, &wait, 1,
+                                                         cu_hw->stream));
+    }
+
+    for (int i = 0; ret >= 0 && i < planes; i++) {
+        CUDA_MEMCPY2D cpy = {
+            .WidthInBytes = av_image_get_linesize(ctx->sw_format, w, i),
+            .Height       = i ? AV_CEIL_RSHIFT(h, pixdesc->log2_chroma_h) : h,
+        };
+
+        if (to_cuda) {
+            cpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            cpy.srcArray      = ci->arr[i];
+            cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            cpy.dstDevice     = (CUdeviceptr)(uintptr_t)cudaf->data[i];
+            cpy.dstPitch      = cudaf->linesize[i];
+        } else {
+            cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            cpy.srcDevice     = (CUdeviceptr)(uintptr_t)cudaf->data[i];
+            cpy.srcPitch      = cudaf->linesize[i];
+            cpy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+            cpy.dstArray      = ci->arr[i];
+        }
+        ret = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, cu_hw->stream));
+    }
+
+    if (ret >= 0) {
+        CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signal = {
+            .params.fence.value = v2,
+        };
+        ret = CHECK_CU(cu->cuSignalExternalSemaphoresAsync(&ci->sem, &signal,
+                                                           1, cu_hw->stream));
+    }
+    if (ret >= 0 && ci->device_ref->data != cuda_fc->device_ref->data) {
+        /* The stream that has to be drained at teardown belongs to this
+         * device context, which must not go away before it. */
+        ret = av_buffer_replace(&ci->device_ref, cuda_fc->device_ref);
+    }
+    if (ret >= 0) {
+        /* No synchronize: the copies stay ordered on the stream for CUDA
+         * consumers, and behind the fence value for D3D11 ones. */
+        ci->cuda_done = v2;
+        ci->stream    = cu_hw->stream;
+    } else {
+        /* cuda_done was not advanced, so nothing will ever wait on v2,
+         * whether it got signaled or not; the next transfer signals a
+         * higher value, which is all a monitored fence asks. */
+        CHECK_CU(cu->cuStreamSynchronize(cu_hw->stream));
+    }
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    if (ret < 0)
+        goto end;
+
+    if (!to_cuda) {
+        /* Only past the fence value do the textures hold the frame; the
+         * wait keeps the assembly behind them, on the GPU. If it cannot be
+         * enqueued, the destination must not be assembled from stale
+         * planes. */
+        hwctx->lock(hwctx->lock_ctx);
+        hr = ID3D11DeviceContext4_Wait(ci->ctx4, ci->fence, v2);
+        if (SUCCEEDED(hr)) {
+            if (planes == 2)
+                ff_d3d11va_bridge_run(ci->bridge, hwctx->device_context, tex,
+                                      index, 0);
+            else
+                ID3D11DeviceContext_CopySubresourceRegion(hwctx->device_context,
+                    tex, index, 0, 0, 0, (ID3D11Resource *)ci->tex, 0, NULL);
+        }
+        hwctx->unlock(hwctx->lock_ctx);
+        if (FAILED(hr)) {
+            ret = AVERROR_EXTERNAL;
+            goto end;
+        }
+    }
+    ret = 0;
+
+end:
+    ff_mutex_unlock(&s->cuda_lock);
+    return ret;
+}
+
+#endif /* CONFIG_CUDA */
 
 static int d3d11va_device_init(AVHWDeviceContext *hwdev)
 {
